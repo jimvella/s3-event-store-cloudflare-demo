@@ -24,6 +24,7 @@
 
 	let listEl: HTMLDivElement | undefined;
 	let headEtag: string | null = null;
+	let stopped = false;
 
 	function flash(msg: string) {
 		banner = msg;
@@ -64,42 +65,65 @@
 		}
 	}
 
+	/** Walk feed pages from our cursor up to `target`, folding the envelopes. */
+	async function foldFrom(target: number) {
+		const wasAtBottom = atBottom();
+		let url: string | null = `${EVENTS_URL}?from=${cursor}`;
+		while (url) {
+			// Bypass the *browser* HTTP cache: complete pages are `immutable`, but
+			// the demo's reset button reuses version numbers, so a cached page can
+			// go stale. The server-side edge cache (caches.default) still serves the
+			// immutable pages fast; we just don't let the browser pin them.
+			const pres: Response = await fetch(url, { cache: 'no-store' });
+			if (!pres.ok) break;
+			const page = (await pres.json()) as WireFeedPage;
+			for (const e of page.events) applyEvent(e);
+			url = page.next && page.to <= target ? page.next : null;
+		}
+		messages.sort((a, b) => a.seq - b.seq);
+		cursor = target + 1;
+		if (wasAtBottom) {
+			await tick();
+			scrollToBottom();
+		}
+	}
+
 	/**
-	 * Live sync using the library's HTTP read model: poll the head resource
-	 * (cheap — an ETag gives a 304 when nothing moved); when the head advances,
-	 * walk feed pages from our cursor, following `next` up to the head page, and
-	 * fold the envelopes. Re-folding an event already seen is a no-op.
+	 * One head read. With `wait`, the server long-polls — it holds the request
+	 * open until the head moves (200) or its deadline (304) — so this resolves
+	 * near-instantly when someone posts, and otherwise blocks instead of spinning.
+	 * A new head sends us into the feed to fold the events.
 	 */
-	async function poll() {
+	async function syncOnce(wait: boolean): Promise<number> {
+		const abort = new AbortController();
+		const guard = setTimeout(() => abort.abort(), 30_000); // safety net past the server hold
 		try {
-			const res = await fetch(HEAD_URL, headEtag ? { headers: { 'if-none-match': headEtag } } : {});
-			if (res.status === 304 || !res.ok) return;
+			const res = await fetch(`${HEAD_URL}${wait ? '?wait' : ''}`, {
+				headers: headEtag ? { 'if-none-match': headEtag } : {},
+				signal: abort.signal
+			});
+			if (res.status === 304) return 304;
+			if (!res.ok) return res.status;
 			headEtag = res.headers.get('etag');
 			const head = (await res.json()) as WireHead;
 			const target = head.version;
-			if (target === null || target < cursor) return; // caught up — nothing new
+			if (target !== null && target >= cursor) await foldFrom(target);
+			return 200;
+		} finally {
+			clearTimeout(guard);
+		}
+	}
 
-			const wasAtBottom = atBottom();
-			let url: string | null = `${EVENTS_URL}?from=${cursor}`;
-			while (url) {
-				// Bypass the *browser* HTTP cache: complete pages are `immutable`, but
-				// the demo's reset button reuses version numbers, so a cached page can
-				// go stale. The server-side edge cache (caches.default) still serves the
-				// immutable pages fast; we just don't let the browser pin them.
-				const pres: Response = await fetch(url, { cache: 'no-store' });
-				if (!pres.ok) break;
-				const page = (await pres.json()) as WireFeedPage;
-				for (const e of page.events) applyEvent(e);
-				url = page.next && page.to <= target ? page.next : null;
+	/** Long-poll forever: each held request returns on a head change or timeout,
+	 * then we immediately re-establish it. */
+	async function longPollLoop() {
+		while (!stopped) {
+			try {
+				await syncOnce(true);
+			} catch {
+				if (stopped) break;
+				await new Promise((r) => setTimeout(r, 2000)); // back off on error/abort
 			}
-			messages.sort((a, b) => a.seq - b.seq);
-			cursor = target + 1;
-			if (wasAtBottom) {
-				await tick();
-				scrollToBottom();
-			}
-		} catch {
-			// transient network error — the next tick will retry
 		}
 	}
 
@@ -165,7 +189,7 @@
 		};
 		const ok = await submit([event]);
 		if (!ok) draft = text; // restore so the user doesn't lose it
-		await poll();
+		await syncOnce(false); // fold our own message immediately, don't wait
 		scrollToBottom();
 	}
 
@@ -192,7 +216,7 @@
 		};
 		if (await submit([event])) {
 			cancelEdit();
-			await poll();
+			await syncOnce(false);
 		}
 	}
 
@@ -203,7 +227,7 @@
 			type: 'MessageDeleted',
 			data: { messageId: m.id }
 		};
-		if (await submit([event])) await poll();
+		if (await submit([event])) await syncOnce(false);
 	}
 
 	function atBottom(): boolean {
@@ -231,8 +255,10 @@
 
 	onMount(() => {
 		scrollToBottom();
-		const id = setInterval(poll, 1500);
-		return () => clearInterval(id);
+		longPollLoop();
+		return () => {
+			stopped = true;
+		};
 	});
 </script>
 

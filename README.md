@@ -37,12 +37,17 @@ There's no authentication — you just pick a username (stored in a cookie).
   `expectedVersion: "any"` — a retry needs a deterministic target window). The
   client's retry loop lives in `submit()` in `src/routes/+page.svelte`; the
   server ingress is `appendEvents` in `src/lib/server/store.ts`.
-- **Reads** use the library's HTTP read model, not a custom endpoint. The client
-  polls the **head resource** (`GET /streams/chat:general/head`) every ~1.5s with
-  an `If-None-Match` ETag — a `304` when nothing moved. When the head advances it
-  walks **feed pages** (`GET …/events?from=<cursor>`) from its cursor, following
-  `next` up to the head page, and folds the envelopes into its local read model.
-  This is exactly the poll-head → follow-into-pages flow the library is built for.
+- **Reads** use the library's HTTP read model, not a custom endpoint, via
+  **long polling**. The client requests the **head resource**
+  (`GET /streams/chat:general/head?wait`) with its last `If-None-Match` ETag; the
+  server holds the request open — re-reading the head every second — until the
+  head moves (`200`) or a ~20s deadline (`304`), then the client immediately
+  re-establishes it. So a new message is delivered within ~1s of being written,
+  and an idle client makes one held request every ~20s instead of dozens. On a
+  `200` it walks **feed pages** (`GET …/events?from=<cursor>`) from its cursor,
+  following `next` up to the head page, and folds the envelopes into its local
+  read model — the poll-head → follow-into-pages flow the library is built for.
+  (Drop `?wait` for a plain conditional `GET` — that's what the API browser uses.)
 
 ## API browser
 
