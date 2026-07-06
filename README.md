@@ -199,5 +199,9 @@ it there if you want a different name.
 
 - Single global room; no real auth; live updates are polling (not WebSockets).
 - Authorization trusts the username cookie — fine for a demo, not for production.
-- The library's compaction, encryption, and crypto-shredding features are not
-  exercised here; see the [upstream README](https://github.com/jimvella/s3-event-store).
+- The library's encryption and crypto-shredding features are not exercised here;
+  see the [upstream README](https://github.com/jimvella/s3-event-store).
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
