@@ -5,6 +5,8 @@ A multi-user chat app that showcases [**@jimvella/s3-event-store**](https://gith
 server process. Built with **SvelteKit** and deployed to **Cloudflare Workers**
 with an **R2** bucket as the event store.
 
+**Live demo: https://s3-event-store-chat-demo.jim-p-vella.workers.dev**
+
 Every action — posting, **editing**, and **deleting** a message — is an
 immutable event appended to a single append-only stream (`chat:general`). The
 message list you see is a *projection* (fold) of that event log, so the full
