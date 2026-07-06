@@ -48,9 +48,11 @@ There's no authentication — you just pick a username (stored in a cookie).
   chain and folds the envelopes into its local read model — the poll-head →
   follow-into-pages flow the library is built for. Own messages are folded
   straight from the append response (`nextExpectedVersion`), so they appear
-  instantly; other people's carry ~1–2s (poll interval + cache TTL). See the
-  cost reasoning in the git history — edge micro-caching decouples both Worker
-  and R2 cost from client count, which a held long-poll can't.
+  instantly; other people's carry ~1–2s (poll interval + cache TTL). Polling is
+  suspended while the tab is hidden (Page Visibility API) and resumes with an
+  immediate sync on return. See the cost reasoning in the git history — edge
+  micro-caching decouples both Worker and R2 cost from client count, which a held
+  long-poll can't.
 
 ## API browser
 

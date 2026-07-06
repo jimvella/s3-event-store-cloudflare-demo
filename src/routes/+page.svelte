@@ -246,8 +246,38 @@
 
 	onMount(() => {
 		scrollToBottom();
-		const id = setInterval(shortPoll, POLL_MS);
-		return () => clearInterval(id);
+
+		// Only poll while the tab is actually in view. A hidden tab makes zero
+		// requests (browsers throttle background timers anyway; this stops them
+		// outright), and on return we sync immediately so the user sees the latest
+		// without waiting for the next tick. Cheap client/battery win — the edge
+		// micro-cache already keeps idle polling nearly free on the origin.
+		let timer: ReturnType<typeof setInterval> | undefined;
+		const start = () => {
+			if (timer === undefined) timer = setInterval(shortPoll, POLL_MS);
+		};
+		const stop = () => {
+			if (timer !== undefined) {
+				clearInterval(timer);
+				timer = undefined;
+			}
+		};
+		const onVisibility = () => {
+			if (document.visibilityState === 'visible') {
+				shortPoll(); // catch up instantly on return
+				start();
+			} else {
+				stop();
+			}
+		};
+
+		document.addEventListener('visibilitychange', onVisibility);
+		if (document.visibilityState === 'visible') start();
+
+		return () => {
+			stop();
+			document.removeEventListener('visibilitychange', onVisibility);
+		};
 	});
 </script>
 
