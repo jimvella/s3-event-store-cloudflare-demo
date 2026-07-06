@@ -687,4 +687,28 @@
 	.req {
 		margin-bottom: 0.2rem;
 	}
+
+	@media (max-width: 640px) {
+		header {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 0.55rem;
+			position: static;
+		}
+		.sub {
+			max-width: none;
+		}
+		.nav {
+			justify-content: flex-start;
+		}
+		.fields {
+			grid-template-columns: 1fr;
+		}
+		.head {
+			gap: 0.4rem;
+		}
+		.send {
+			margin-left: 0;
+		}
+	}
 </style>

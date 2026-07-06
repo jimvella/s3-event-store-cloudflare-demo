@@ -322,7 +322,7 @@
 			bind:value={draft}
 			onkeydown={onKeydown}
 			rows="1"
-			placeholder="Message #general — Enter to send, Shift+Enter for a newline"
+			placeholder="Message #general…"
 		></textarea>
 		<button class="send" onclick={send} disabled={!draft.trim()}>Send</button>
 	</div>
@@ -372,6 +372,8 @@
 		align-items: center;
 		gap: 0.6rem;
 		white-space: nowrap;
+		flex-wrap: wrap;
+		justify-content: flex-end;
 	}
 	.me {
 		font-size: 0.8rem;
@@ -553,5 +555,26 @@
 	.send:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	@media (max-width: 640px) {
+		header {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 0.55rem;
+			padding: 0.7rem 0.9rem;
+		}
+		.who {
+			justify-content: flex-start;
+		}
+		.me {
+			flex-basis: 100%;
+		}
+		.bubble {
+			max-width: 88%;
+		}
+		.composer {
+			padding: 0.7rem 0.9rem;
+		}
 	}
 </style>
