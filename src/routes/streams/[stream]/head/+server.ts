@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
-import { readHead, toWireHead } from '@jimvella/s3-event-store';
-import { getStore, ROOM_STREAM } from '$lib/server/store';
+import { toWireHead } from '@jimvella/s3-event-store';
+import { cachedReadHead, getStore, ROOM_STREAM } from '$lib/server/store';
 import type { RequestHandler } from './$types';
 
 // Long-poll tuning: hold a `?wait` request open at most LONG_POLL_MS, re-reading
@@ -30,14 +30,15 @@ export const GET: RequestHandler = async ({ params, request, url, platform, loca
 	const store = getStore(platform.env);
 	const inm = request.headers.get('if-none-match');
 
-	// pageSize defaults to store.chunkSize, so `head` lands on a real page boundary.
-	let head = await readHead(store, params.stream);
+	// Read through a 1s edge micro-cache so a burst of concurrent pollers collapses
+	// to ~one R2 head read per second per colo (see cachedReadHead).
+	let head = await cachedReadHead(store, url.origin, params.stream);
 
 	if (url.searchParams.has('wait') && inm && inm === head.etag) {
 		const deadline = Date.now() + LONG_POLL_MS;
 		while (Date.now() < deadline && head.etag === inm) {
 			await sleep(POLL_INTERVAL_MS);
-			head = await readHead(store, params.stream);
+			head = await cachedReadHead(store, url.origin, params.stream);
 		}
 	}
 

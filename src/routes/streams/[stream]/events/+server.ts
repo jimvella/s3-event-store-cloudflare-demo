@@ -6,6 +6,7 @@ import {
 	edgeCache,
 	feedPageCacheKey,
 	getStore,
+	headCacheKey,
 	headVersion,
 	ROOM_STREAM
 } from '$lib/server/store';
@@ -73,7 +74,7 @@ export const GET: RequestHandler = async ({ params, url, platform, locals }) => 
  * `compactStream` does at most one bucket per call and no-ops if there's
  * nothing to do, and racing compactors stand down.
  */
-export const POST: RequestHandler = async ({ params, request, platform, locals }) => {
+export const POST: RequestHandler = async ({ params, request, url, platform, locals }) => {
 	if (!locals.username) throw error(401, 'Not logged in');
 	if (!platform?.env) throw error(500, 'R2 binding unavailable');
 	if (params.stream !== ROOM_STREAM) throw error(404, `Unknown stream: ${params.stream}`);
@@ -93,6 +94,15 @@ export const POST: RequestHandler = async ({ params, request, platform, locals }
 	const store = getStore(platform.env);
 	try {
 		const result = await appendEvents(store, locals.username, body.events, expectedVersion);
+
+		if (result.outcome === 'appended') {
+			// The head moved — drop the 1s micro-cache entry so pollers (this
+			// client's own immediate sync included) see the new head now, not up
+			// to a second late. Best-effort and per-colo; the TTL is the backstop.
+			edgeCache()
+				?.delete(headCacheKey(url.origin, ROOM_STREAM))
+				.catch(() => {});
+		}
 
 		if (result.compactionSuggested) {
 			// Background compaction: starts now, survives past the response via

@@ -48,6 +48,11 @@ There's no authentication — you just pick a username (stored in a cookie).
   following `next` up to the head page, and folds the envelopes into its local
   read model — the poll-head → follow-into-pages flow the library is built for.
   (Drop `?wait` for a plain conditional `GET` — that's what the API browser uses.)
+  Head resolution is memoized behind a **1s edge micro-cache** (`cachedReadHead`),
+  invalidated on append, so the R2 head-read rate stays flat no matter how many
+  clients are watching. The full trade-off analysis — short vs long polling, the
+  R2 cost model, and the Durable-Object crossover — is in
+  [POLLING_CONSIDERATIONS.md](./POLLING_CONSIDERATIONS.md).
 
 ## API browser
 

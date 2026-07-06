@@ -13,9 +13,11 @@
 import {
 	createEventStore,
 	idempotentAppend,
+	readHead,
 	type EventEnvelope,
 	type EventInput,
-	type EventStore
+	type EventStore,
+	type HeadResource
 } from '@jimvella/s3-event-store';
 import { r2BindingDriver, type R2BucketLike } from '@jimvella/s3-event-store/drivers/r2-binding';
 import type {
@@ -270,4 +272,48 @@ export function edgeCache(): EdgeCache | undefined {
  */
 export function feedPageCacheKey(origin: string, stream: string, from: number): Request {
 	return new Request(`${origin}/streams/${encodeURIComponent(stream)}/events?from=${from}`);
+}
+
+/** Internal edge-cache key for the memoized head resolution (never routed). */
+export function headCacheKey(origin: string, stream: string): Request {
+	return new Request(`${origin}/__cache/head/${encodeURIComponent(stream)}`);
+}
+
+/**
+ * Resolve the head, memoized in the edge cache for ~1s. `readHead` is the one
+ * intrinsically uncacheable read (it moves on every append), and under long
+ * polling every held client re-checks it every second — so without this the R2
+ * head-read rate scales with the number of connected clients. The micro-cache
+ * collapses that: within any 1s window the first poll does the real R2 read and
+ * everyone else (per colo) gets a free cache hit, so head reads become
+ * O(streams x time) instead of O(clients x time). Appends invalidate the entry
+ * (see the events route) so a fresh head is visible immediately, not up to a
+ * second late. The client-facing head response stays `no-store` — this cache is
+ * a private server-side detail keyed on a synthetic URL.
+ */
+export async function cachedReadHead(
+	store: EventStore,
+	origin: string,
+	stream: string
+): Promise<HeadResource> {
+	const cache = edgeCache();
+	const key = headCacheKey(origin, stream);
+	if (cache) {
+		const hit = await cache.match(key);
+		if (hit) return (await hit.json()) as HeadResource;
+	}
+	const head = await readHead(store, stream);
+	if (cache) {
+		try {
+			await cache.put(
+				key,
+				new Response(JSON.stringify(head), {
+					headers: { 'content-type': 'application/json', 'cache-control': 'max-age=1' }
+				})
+			);
+		} catch {
+			/* not cacheable in this runtime — ignore */
+		}
+	}
+	return head;
 }
