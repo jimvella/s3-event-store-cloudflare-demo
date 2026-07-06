@@ -12,6 +12,16 @@ const POLL_INTERVAL_MS = 1_000;
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Weak ETag comparison, per RFC 7232 §3.2 (`If-None-Match` uses the weak
+ * function). Cloudflare rewrites our strong `"v9"` to a *weak* `W/"v9"` whenever
+ * it compresses the response, so a strict `===` would never match a browser's
+ * `If-None-Match` — the hold would be skipped and long polling would collapse
+ * into a busy loop. Strip the optional `W/` prefix from both sides before comparing.
+ */
+const etagMatches = (a: string | null, b: string | null): boolean =>
+	a != null && b != null && a.replace(/^W\//, '') === b.replace(/^W\//, '');
+
+/**
  * The head resource (DESIGN.md, `GET …/head`) — the pollable "current version"
  * target that complements the immutable feed pages. Send the last `etag` back as
  * `If-None-Match`; an unchanged head answers `304 Not Modified`.
@@ -34,9 +44,9 @@ export const GET: RequestHandler = async ({ params, request, url, platform, loca
 	// to ~one R2 head read per second per colo (see cachedReadHead).
 	let head = await cachedReadHead(store, url.origin, params.stream);
 
-	if (url.searchParams.has('wait') && inm && inm === head.etag) {
+	if (url.searchParams.has('wait') && etagMatches(inm, head.etag)) {
 		const deadline = Date.now() + LONG_POLL_MS;
-		while (Date.now() < deadline && head.etag === inm) {
+		while (Date.now() < deadline && etagMatches(inm, head.etag)) {
 			await sleep(POLL_INTERVAL_MS);
 			head = await cachedReadHead(store, url.origin, params.stream);
 		}
@@ -45,7 +55,7 @@ export const GET: RequestHandler = async ({ params, request, url, platform, loca
 	const headers = { etag: head.etag, 'cache-control': 'no-store' };
 
 	// Conditional request: still-unchanged head → 304, no body.
-	if (inm === head.etag) {
+	if (etagMatches(inm, head.etag)) {
 		return new Response(null, { status: 304, headers });
 	}
 
