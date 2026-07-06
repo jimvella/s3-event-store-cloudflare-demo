@@ -23,8 +23,9 @@
 	let bannerTimer: ReturnType<typeof setTimeout> | undefined;
 
 	let listEl: HTMLDivElement | undefined;
-	let headEtag: string | null = null;
-	let stopped = false;
+	let polling = false;
+
+	const POLL_MS = 1500; // > the head's 1s edge TTL, so each poll gets a fresh edge copy
 
 	function flash(msg: string) {
 		banner = msg;
@@ -89,41 +90,24 @@
 	}
 
 	/**
-	 * One head read. With `wait`, the server long-polls — it holds the request
-	 * open until the head moves (200) or its deadline (304) — so this resolves
-	 * near-instantly when someone posts, and otherwise blocks instead of spinning.
-	 * A new head sends us into the feed to fold the events.
+	 * Short poll: read the head (letting the browser/edge micro-cache serve it —
+	 * that's what keeps origin load flat), and if it moved past our cursor, walk
+	 * the feed to fold the new events. The `polling` guard skips a tick if the
+	 * previous one is still folding. Our own messages are folded immediately from
+	 * the append response (see `send`), so this only carries *other* people's.
 	 */
-	async function syncOnce(wait: boolean): Promise<number> {
-		const abort = new AbortController();
-		const guard = setTimeout(() => abort.abort(), 30_000); // safety net past the server hold
+	async function shortPoll() {
+		if (polling) return;
+		polling = true;
 		try {
-			const res = await fetch(`${HEAD_URL}${wait ? '?wait' : ''}`, {
-				headers: headEtag ? { 'if-none-match': headEtag } : {},
-				signal: abort.signal
-			});
-			if (res.status === 304) return 304;
-			if (!res.ok) return res.status;
-			headEtag = res.headers.get('etag');
+			const res = await fetch(HEAD_URL); // default cache mode → hits the 1s edge cache
+			if (!res.ok) return;
 			const head = (await res.json()) as WireHead;
-			const target = head.version;
-			if (target !== null && target >= cursor) await foldFrom(target);
-			return 200;
+			if (head.version !== null && head.version >= cursor) await foldFrom(head.version);
+		} catch {
+			// transient — the next tick retries
 		} finally {
-			clearTimeout(guard);
-		}
-	}
-
-	/** Long-poll forever: each held request returns on a head change or timeout,
-	 * then we immediately re-establish it. */
-	async function longPollLoop() {
-		while (!stopped) {
-			try {
-				await syncOnce(true);
-			} catch {
-				if (stopped) break;
-				await new Promise((r) => setTimeout(r, 2000)); // back off on error/abort
-			}
+			polling = false;
 		}
 	}
 
@@ -144,11 +128,12 @@
 	 * and retry the *same* events. A dropped response is retried the same way and
 	 * comes back `alreadyCommitted`, so nothing double-posts.
 	 *
-	 * This is purely the write: it never touches `cursor`. The caller follows a
-	 * successful submit with `poll()`, which reads the new events (our own
-	 * included) back through the head + feed and advances the cursor.
+	 * This is purely the write: it never touches `cursor`. On success it returns
+	 * the stream's new head version (from the append response) so the caller can
+	 * fold its own events straight from the feed — no head read, so own messages
+	 * appear instantly and never hit the micro-cache's ≤1s staleness.
 	 */
-	async function submit(events: ClientEvent[]): Promise<boolean> {
+	async function submit(events: ClientEvent[]): Promise<number | null> {
 		let expectedVersion: number | 'noStream' = cursor <= 0 ? 'noStream' : cursor - 1;
 		for (let attempt = 0; attempt < 6; attempt++) {
 			let res: Response;
@@ -170,12 +155,13 @@
 			}
 			if (!res.ok) {
 				flash(await readBody(res));
-				return false;
+				return null;
 			}
-			return true;
+			const { nextExpectedVersion } = (await res.json()) as { nextExpectedVersion: number };
+			return nextExpectedVersion;
 		}
 		flash('Could not append after several retries — heavy contention, try again.');
-		return false;
+		return null;
 	}
 
 	async function send() {
@@ -187,9 +173,12 @@
 			type: 'MessagePosted',
 			data: { messageId: crypto.randomUUID(), username: me, text }
 		};
-		const ok = await submit([event]);
-		if (!ok) draft = text; // restore so the user doesn't lose it
-		await syncOnce(false); // fold our own message immediately, don't wait
+		const version = await submit([event]);
+		if (version === null) {
+			draft = text; // restore so the user doesn't lose it
+			return;
+		}
+		await foldFrom(version); // fold our own message immediately, no head read
 		scrollToBottom();
 	}
 
@@ -214,9 +203,10 @@
 			type: 'MessageEdited',
 			data: { messageId: m.id, text }
 		};
-		if (await submit([event])) {
+		const version = await submit([event]);
+		if (version !== null) {
 			cancelEdit();
-			await syncOnce(false);
+			await foldFrom(version);
 		}
 	}
 
@@ -227,7 +217,8 @@
 			type: 'MessageDeleted',
 			data: { messageId: m.id }
 		};
-		if (await submit([event])) await syncOnce(false);
+		const version = await submit([event]);
+		if (version !== null) await foldFrom(version);
 	}
 
 	function atBottom(): boolean {
@@ -255,10 +246,8 @@
 
 	onMount(() => {
 		scrollToBottom();
-		longPollLoop();
-		return () => {
-			stopped = true;
-		};
+		const id = setInterval(shortPoll, POLL_MS);
+		return () => clearInterval(id);
 	});
 </script>
 

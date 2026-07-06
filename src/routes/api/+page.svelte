@@ -68,7 +68,7 @@
 			method: 'GET',
 			path: '/streams/chat:general/head',
 			title: 'Read the pollable head resource',
-			desc: "The poll target (readHead/toWireHead): { version, head, etag }, served no-store with a strong ETag. Send it once to get the ETag, then use “Resend with If-None-Match” below to replay the poll — an unchanged head answers 304 Not Modified with no body.",
+			desc: "The short-poll target (readHead/toWireHead): { version, head, etag }, served Cache-Control: public, max-age=1 so Cloudflare edge-caches it for a second — a burst of client polls is absorbed at the edge (no Worker, no R2). Appends purge it. Send the ETag back as If-None-Match for a 304 once the cache goes stale.",
 			fields: [
 				{
 					name: 'If-None-Match',

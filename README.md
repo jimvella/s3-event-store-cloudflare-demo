@@ -37,20 +37,20 @@ There's no authentication — you just pick a username (stored in a cookie).
   `expectedVersion: "any"` — a retry needs a deterministic target window). The
   client's retry loop lives in `submit()` in `src/routes/+page.svelte`; the
   server ingress is `appendEvents` in `src/lib/server/store.ts`.
-- **Reads** use the library's HTTP read model, not a custom endpoint, via
-  **long polling**. The client requests the **head resource**
-  (`GET /streams/chat:general/head?wait`) with its last `If-None-Match` ETag; the
-  server holds the request open — re-reading the head every second — until the
-  head moves (`200`) or a ~20s deadline (`304`), then the client immediately
-  re-establishes it. So a new message is delivered within ~1s of being written,
-  and an idle client makes one held request every ~20s instead of dozens. On a
-  `200` it walks **feed pages** (`GET …/events?from=<cursor>`) from its cursor,
-  following `next` up to the head page, and folds the envelopes into its local
-  read model — the poll-head → follow-into-pages flow the library is built for.
-  (Drop `?wait` for a plain conditional `GET` — that's what the API browser uses.)
-  Head resolution is memoized behind a **1s edge micro-cache** (`cachedReadHead`),
-  invalidated on append, so the R2 head-read rate stays flat no matter how many
-  clients are watching.
+- **Reads** use the library's HTTP read model, not a custom endpoint. The client
+  **short-polls** the **head resource** (`GET /streams/chat:general/head`) every
+  ~1.5s. That response is served `Cache-Control: public, max-age=1`, so
+  Cloudflare **edge micro-caches** it: a burst of polls within any 1s window is
+  served from the edge — **no Worker invocation, no R2 read** — so origin cost
+  stays flat no matter how many clients poll. Appends purge the entry so a new
+  head shows up within a poll interval. When the head has moved past the client's
+  cursor it walks **feed pages** (`GET …/events?from=<cursor>`) up the `next`
+  chain and folds the envelopes into its local read model — the poll-head →
+  follow-into-pages flow the library is built for. Own messages are folded
+  straight from the append response (`nextExpectedVersion`), so they appear
+  instantly; other people's carry ~1–2s (poll interval + cache TTL). See the
+  cost reasoning in the git history — edge micro-caching decouples both Worker
+  and R2 cost from client count, which a held long-poll can't.
 
 ## API browser
 

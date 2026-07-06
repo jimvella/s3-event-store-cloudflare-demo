@@ -6,7 +6,7 @@ import {
 	edgeCache,
 	feedPageCacheKey,
 	getStore,
-	headCacheKey,
+	headResponseCacheKeys,
 	headVersion,
 	ROOM_STREAM
 } from '$lib/server/store';
@@ -96,12 +96,15 @@ export const POST: RequestHandler = async ({ params, request, url, platform, loc
 		const result = await appendEvents(store, locals.username, body.events, expectedVersion);
 
 		if (result.outcome === 'appended') {
-			// The head moved — drop the 1s micro-cache entry so pollers (this
-			// client's own immediate sync included) see the new head now, not up
-			// to a second late. Best-effort and per-colo; the TTL is the backstop.
-			edgeCache()
-				?.delete(headCacheKey(url.origin, ROOM_STREAM))
-				.catch(() => {});
+			// The head moved — purge its edge-cached copy so the next poll (in this
+			// colo) sees the new head now, not up to the 1s TTL late. Best-effort
+			// and per-colo; the TTL is the backstop for other colos.
+			const cache = edgeCache();
+			if (cache) {
+				for (const key of headResponseCacheKeys(url.origin, ROOM_STREAM)) {
+					cache.delete(key).catch(() => {});
+				}
+			}
 		}
 
 		if (result.compactionSuggested) {
