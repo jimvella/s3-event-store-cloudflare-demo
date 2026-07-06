@@ -50,9 +50,7 @@ There's no authentication — you just pick a username (stored in a cookie).
   (Drop `?wait` for a plain conditional `GET` — that's what the API browser uses.)
   Head resolution is memoized behind a **1s edge micro-cache** (`cachedReadHead`),
   invalidated on append, so the R2 head-read rate stays flat no matter how many
-  clients are watching. The full trade-off analysis — short vs long polling, the
-  R2 cost model, and the Durable-Object crossover — is in
-  [POLLING_CONSIDERATIONS.md](./POLLING_CONSIDERATIONS.md).
+  clients are watching.
 
 ## API browser
 
