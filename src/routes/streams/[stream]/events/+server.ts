@@ -1,5 +1,11 @@
 import { error, json, redirect } from '@sveltejs/kit';
-import { canonicalFrom, ConcurrencyError, readPage, toWireFeed } from '@jimvella/s3-event-store';
+import {
+	canonicalFrom,
+	ConcurrencyError,
+	readPage,
+	SubjectErasedError,
+	toWireFeed
+} from '@jimvella/s3-event-store';
 import {
 	appendEvents,
 	CommandError,
@@ -124,6 +130,12 @@ export const POST: RequestHandler = async ({ params, request, url, platform, loc
 			);
 		}
 		if (e instanceof CommandError) throw error(e.status, e.message);
+		// The append path's fail-closed rule: once a shred is requested, the
+		// encrypting serializer refuses to store new personal data for that
+		// subject — the append dies before any PUT.
+		if (e instanceof SubjectErasedError) {
+			throw error(410, 'Your account has been erased (crypto-shredded) — posting is disabled.');
+		}
 		throw e;
 	}
 };

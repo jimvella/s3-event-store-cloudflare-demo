@@ -1,20 +1,125 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import type { EventEnvelope, WireFeedPage, WireHead } from '@jimvella/s3-event-store';
-	import type { Message } from '$lib/types';
+	import {
+		base64ToBytes,
+		decryptField,
+		importAesKey,
+		isEncryptedField,
+		type EncryptedField,
+		type WireKeyring
+	} from '$lib/crypto';
+	import type { Message, StoredText } from '$lib/types';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
 	const me = data.username ?? '';
-	const EVENTS_URL = `/streams/${encodeURIComponent('chat:general')}/events`;
-	const HEAD_URL = `/streams/${encodeURIComponent('chat:general')}/head`;
+	const STREAM = 'chat:general';
+	const EVENTS_URL = `/streams/${encodeURIComponent(STREAM)}/events`;
+	const HEAD_URL = `/streams/${encodeURIComponent(STREAM)}/head`;
 
 	type ClientEvent = { id: string; type: string; data: Record<string, unknown> };
 
+	/**
+	 * A message as the client renders it. The feed only ever carries ciphertext
+	 * (model B — the server never decrypts), so alongside the projection fields
+	 * we track the current ciphertext envelope, the locally decrypted plaintext,
+	 * and whether decryption failed closed (author crypto-shredded).
+	 */
+	type ViewMessage = Omit<Message, 'text'> & {
+		/** Ciphertext envelope of the current text; null for legacy plaintext. */
+		cipher: EncryptedField | null;
+		/** Locally decrypted text ('' while decryption is pending). */
+		plain: string;
+		/** Fail-closed marker: no key can be delivered for this ciphertext. */
+		erased: boolean;
+	};
+
+	function toView(m: Omit<Message, 'text'>, text: StoredText): ViewMessage {
+		const enc = isEncryptedField(text);
+		return {
+			...m,
+			cipher: enc ? text : null,
+			plain: enc ? '' : (text as string),
+			erased: false
+		};
+	}
+
 	// Client-side read model: the array is the source of truth, kept sorted by seq.
-	let messages = $state<Message[]>([...data.messages]);
+	let messages = $state<ViewMessage[]>(data.messages.map((m) => toView(m, m.text)));
 	let cursor = $state<number>(data.cursor);
+
+	// -------------------------------------------------------------------------
+	// Local decryption (model B)
+	// -------------------------------------------------------------------------
+	//
+	// Keyrings are fetched per author from `/keys/{username}/keyring` and the
+	// keys imported into non-extractable WebCrypto handles, cached by keyId.
+	// A keyId the cached keyring doesn't know triggers ONE fresh fetch (deduped
+	// across concurrent misses); if the key still isn't deliverable, the
+	// message renders as erased — decryption fails closed, never shows stale
+	// plaintext. A periodic refresh re-fetches keyrings so a shred (or a
+	// cancellation) done elsewhere converges in every open tab.
+
+	const keyCache = new Map<string, Map<string, CryptoKey>>();
+	const keyringFetches = new Map<string, Promise<Map<string, CryptoKey>>>();
+
+	function loadKeyring(username: string): Promise<Map<string, CryptoKey>> {
+		let p = keyringFetches.get(username);
+		if (!p) {
+			p = (async () => {
+				const keys = new Map<string, CryptoKey>();
+				try {
+					const res = await fetch(`/keys/${encodeURIComponent(username)}/keyring`, {
+						cache: 'no-store'
+					});
+					if (res.ok) {
+						const { keyring } = (await res.json()) as WireKeyring;
+						for (const e of keyring) keys.set(e.keyId, await importAesKey(base64ToBytes(e.key)));
+					}
+				} catch {
+					/* transient — treated as an empty keyring; the refresh loop retries */
+				}
+				keyCache.set(username, keys);
+				return keys;
+			})().finally(() => keyringFetches.delete(username));
+			keyringFetches.set(username, p);
+		}
+		return p;
+	}
+
+	/** Decrypt a message's current ciphertext in place, failing closed. */
+	async function decryptMessage(m: ViewMessage) {
+		const cipher = m.cipher;
+		if (!cipher || m.deleted) return;
+		let keys = keyCache.get(m.username) ?? (await loadKeyring(m.username));
+		let key = keys.get(cipher.keyId);
+		if (!key) {
+			keys = await loadKeyring(m.username); // one fresh look before giving up
+			key = keys.get(cipher.keyId);
+		}
+		if (m.cipher !== cipher || m.deleted) return; // edited/deleted while we fetched
+		if (!key) {
+			m.erased = true;
+			m.plain = '';
+			return;
+		}
+		try {
+			m.plain = await decryptField(key, STREAM, 'text', cipher);
+			m.erased = false;
+		} catch {
+			m.erased = true; // wrong key or tampered ciphertext — never show garbage
+			m.plain = '';
+		}
+	}
+
+	/** Drop cached keyrings and re-decrypt everything — how a shred done in
+	 * another tab (or its cancellation) becomes visible here. */
+	async function refreshKeys() {
+		keyCache.clear();
+		await Promise.all(messages.map(decryptMessage));
+	}
 
 	let draft = $state('');
 	let editingId = $state<string | null>(null);
@@ -26,6 +131,7 @@
 	let polling = false;
 
 	const POLL_MS = 1500; // > the head's 1s edge TTL, so each poll gets a fresh edge copy
+	const KEY_REFRESH_MS = 15_000; // keyring re-fetch: how fast a remote shred/cancel shows up here
 
 	function flash(msg: string) {
 		banner = msg;
@@ -33,35 +139,51 @@
 		bannerTimer = setTimeout(() => (banner = null), 4000);
 	}
 
-	/** Fold one stored event envelope into the local read model. */
+	/** Fold one stored event envelope into the local read model. The `text` in
+	 * the envelope is whatever was stored — normally a ciphertext field — so a
+	 * fold schedules local decryption rather than trusting it to be readable. */
 	function applyEvent(e: EventEnvelope) {
 		const ts = e.meta?.ts ?? '';
 		if (e.type === 'MessagePosted') {
-			const d = e.data as { messageId: string; username: string; text: string };
+			const d = e.data as { messageId: string; username: string; text: StoredText };
 			if (!messages.some((m) => m.id === d.messageId)) {
-				messages.push({
-					id: d.messageId,
-					username: d.username,
-					text: d.text,
-					seq: e.version,
-					postedAt: ts,
-					editedAt: null,
-					deleted: false
-				});
+				const m = toView(
+					{
+						id: d.messageId,
+						username: d.username,
+						seq: e.version,
+						postedAt: ts,
+						editedAt: null,
+						deleted: false
+					},
+					d.text
+				);
+				messages.push(m);
+				void decryptMessage(messages[messages.length - 1]);
 			}
 		} else if (e.type === 'MessageEdited') {
-			const d = e.data as { messageId: string; text: string };
+			const d = e.data as { messageId: string; text: StoredText };
 			const m = messages.find((x) => x.id === d.messageId);
 			if (m && !m.deleted) {
-				m.text = d.text;
+				if (isEncryptedField(d.text)) {
+					m.cipher = d.text;
+					m.plain = '';
+				} else {
+					m.cipher = null;
+					m.plain = d.text;
+				}
+				m.erased = false;
 				m.editedAt = ts;
+				void decryptMessage(m);
 			}
 		} else if (e.type === 'MessageDeleted') {
 			const d = e.data as { messageId: string };
 			const m = messages.find((x) => x.id === d.messageId);
 			if (m) {
 				m.deleted = true;
-				m.text = '';
+				m.cipher = null;
+				m.plain = '';
+				m.erased = false;
 			}
 		}
 	}
@@ -182,9 +304,9 @@
 		scrollToBottom();
 	}
 
-	function startEdit(m: Message) {
+	function startEdit(m: ViewMessage) {
 		editingId = m.id;
-		editText = m.text;
+		editText = m.plain;
 	}
 
 	function cancelEdit() {
@@ -192,9 +314,9 @@
 		editText = '';
 	}
 
-	async function saveEdit(m: Message) {
+	async function saveEdit(m: ViewMessage) {
 		const text = editText.trim();
-		if (!text || text === m.text) {
+		if (!text || text === m.plain) {
 			cancelEdit();
 			return;
 		}
@@ -210,7 +332,7 @@
 		}
 	}
 
-	async function remove(m: Message) {
+	async function remove(m: ViewMessage) {
 		if (!confirm('Delete this message? Its history stays in the event log.')) return;
 		const event: ClientEvent = {
 			id: crypto.randomUUID(),
@@ -247,24 +369,35 @@
 	onMount(() => {
 		scrollToBottom();
 
+		// The SSR payload carries ciphertext (the server can't and doesn't
+		// decrypt) — resolve it locally now that WebCrypto is available.
+		void Promise.all(messages.map(decryptMessage));
+
 		// Only poll while the tab is actually in view. A hidden tab makes zero
 		// requests (browsers throttle background timers anyway; this stops them
 		// outright), and on return we sync immediately so the user sees the latest
 		// without waiting for the next tick. Cheap client/battery win — the edge
 		// micro-cache already keeps idle polling nearly free on the origin.
 		let timer: ReturnType<typeof setInterval> | undefined;
+		let keyTimer: ReturnType<typeof setInterval> | undefined;
 		const start = () => {
 			if (timer === undefined) timer = setInterval(shortPoll, POLL_MS);
+			if (keyTimer === undefined) keyTimer = setInterval(refreshKeys, KEY_REFRESH_MS);
 		};
 		const stop = () => {
 			if (timer !== undefined) {
 				clearInterval(timer);
 				timer = undefined;
 			}
+			if (keyTimer !== undefined) {
+				clearInterval(keyTimer);
+				keyTimer = undefined;
+			}
 		};
 		const onVisibility = () => {
 			if (document.visibilityState === 'visible') {
 				shortPoll(); // catch up instantly on return
+				refreshKeys();
 				start();
 			} else {
 				stop();
@@ -303,6 +436,7 @@
 			>
 			<a class="ghost" href="/store">🗄️ Storage</a>
 			<a class="ghost" href="/api">🔌 API</a>
+			<a class="ghost" href="/keys">🔑 Keys</a>
 			<form method="POST" action="/logout">
 				<button class="ghost" type="submit">Log out</button>
 			</form>
@@ -325,6 +459,10 @@
 
 					{#if m.deleted}
 						<div class="tombstone">🚫 This message was deleted</div>
+					{:else if m.erased}
+						<div class="tombstone">
+							🔒 Erased — the author's encryption key has been destroyed
+						</div>
 					{:else if editingId === m.id}
 						<div class="editor">
 							<textarea
@@ -344,13 +482,13 @@
 							</div>
 						</div>
 					{:else}
-						<div class="text">{m.text}</div>
+						<div class="text">{m.plain}</div>
 					{/if}
 
 					<div class="meta">
 						<span class="time">{fmtTime(m.editedAt ?? m.postedAt)}</span>
 						{#if m.editedAt && !m.deleted}<span class="edited">(edited)</span>{/if}
-						{#if mine && !m.deleted && editingId !== m.id}
+						{#if mine && !m.deleted && !m.erased && editingId !== m.id}
 							<span class="actions">
 								<button class="link" onclick={() => startEdit(m)}>edit</button>
 								<button class="link danger" onclick={() => remove(m)}>delete</button>

@@ -18,6 +18,8 @@ import {
 	type EventStore
 } from '@jimvella/s3-event-store';
 import { r2BindingDriver, type R2BucketLike } from '@jimvella/s3-event-store/drivers/r2-binding';
+import { fieldEncryptingSerializer } from '$lib/server/fieldCrypto';
+import { getKeyStore, subjectForUsername } from '$lib/server/keys';
 import type {
 	ChatEventType,
 	Message,
@@ -50,13 +52,30 @@ export class CommandError extends Error {
 	}
 }
 
-/** Build an EventStore backed by the Worker's R2 binding. */
+/**
+ * Build an EventStore backed by the Worker's R2 binding.
+ *
+ * The serializer is the library's encryption seam: on append it encrypts each
+ * event's `text` field under its author's key (field-level — `username` and
+ * `messageId` stay plaintext), and on read it passes the stored ciphertext
+ * through verbatim, because decryption is the browser's job (see
+ * fieldCrypto.ts). The subject is a keyed hash of the author's username, so
+ * no PII reaches the key store's object keys.
+ */
 export function getStore(env: App.Platform['env']): EventStore {
 	return createEventStore({
 		// A real R2Bucket satisfies the driver's structural R2BucketLike.
 		driver: r2BindingDriver(env.EVENTS as unknown as R2BucketLike),
 		prefix: 'chat',
-		chunkSize: CHUNK_SIZE
+		chunkSize: CHUNK_SIZE,
+		serializer: fieldEncryptingSerializer({
+			keys: getKeyStore(env),
+			subjectFor: (event) => {
+				const d = event.data as { username?: unknown };
+				return typeof d?.username === 'string' ? subjectForUsername(env, d.username) : null;
+			},
+			encryptedFields: { MessagePosted: ['text'], MessageEdited: ['text'] }
+		})
 	});
 }
 
@@ -184,7 +203,10 @@ function authorizeEvent(raw: unknown, username: string, state: Map<string, Messa
 		if (m.deleted) throw new CommandError(409, 'Cannot edit a deleted message');
 		const text = validateText(d.text);
 		m.text = text;
-		return { id, type, data: { messageId: m.id, text } };
+		// Stamp the owner (== the acting user, enforced above) so the event is
+		// self-describing: the encrypting serializer derives the key subject
+		// from the event alone, without projection state.
+		return { id, type, data: { messageId: m.id, username, text } };
 	}
 
 	// MessageDeleted

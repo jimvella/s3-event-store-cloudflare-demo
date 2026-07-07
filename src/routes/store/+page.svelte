@@ -118,6 +118,7 @@
 				{wiping ? 'Resetting…' : '🗑 Delete bucket & flush caches'}
 			</button>
 			<a class="ghost" href="/api">🔌 API</a>
+			<a class="ghost" href="/keys">🔑 Keys</a>
 			<a class="ghost" href="/">← Back to chat</a>
 		</div>
 	</header>

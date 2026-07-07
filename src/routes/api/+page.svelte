@@ -77,6 +77,47 @@
 					placeholder: 'paste an ETag (e.g. "v7") to test a 304'
 				}
 			]
+		},
+		{
+			id: 'keyring',
+			method: 'GET',
+			path: '/keys/{username}/keyring',
+			title: 'Keyring delivery — the decryption keys (model B)',
+			desc: 'Every key generation a user has, base64, served no-store (contrast with the immutable ciphertext feed pages). The browser decrypts message text locally with these. The username maps to a hashed subject server-side. Once a shred is requested, this returns an EMPTY keyring — that is the instant, everywhere-at-once soft delete.',
+			fields: [{ name: 'username', label: 'username', kind: 'path', default: me }]
+		},
+		{
+			id: 'rotate',
+			method: 'POST',
+			path: '/api/keys/rotate',
+			title: 'Rotate your data key',
+			desc: 'Mint the next key generation for your account. Old generations stay deliverable (existing messages keep decrypting); new messages encrypt under the new keyId — post one after rotating and compare the per-field keyId in the feed.',
+			fields: []
+		},
+		{
+			id: 'shred',
+			method: 'POST',
+			path: '/api/shred',
+			title: 'Request crypto-shredding (GDPR erasure) of YOUR account',
+			desc: "The library's requestShred: appends a ShredRequested intent to $system.key-audit, then writes the tombstone (pending). Instantly soft-deleted: your keyring goes empty, your messages render as erased, appends fail closed with 410. Nothing is destroyed until the sweeper runs after the waiting period — cancel before that and everything comes back.",
+			fields: [],
+			danger: true
+		},
+		{
+			id: 'shred-cancel',
+			method: 'POST',
+			path: '/api/shred/cancel',
+			title: 'Cancel a pending shred',
+			desc: 'Audit-first cancellation of the intent stamped on your tombstone. Works while the tombstone is pending; once the sweeper has moved it to committing the point of no return has passed (lost-to-commit).',
+			fields: []
+		},
+		{
+			id: 'sweep',
+			method: 'POST',
+			path: '/api/shred/sweep',
+			title: 'Run the shred sweeper',
+			desc: 'The one clock-driven job (a cron in production, a button here). Scans $system.key-audit from its checkpoint and drives every open intent to completion: inside the waiting period → openSubjects, untouched; past it → keys hard-deleted + ShredCompleted appended. Idempotent — fire it as often as you like.',
+			fields: []
 		}
 	];
 
@@ -281,6 +322,7 @@
 		</div>
 		<div class="nav">
 			<a class="ghost" href="/store">🗄️ Storage</a>
+			<a class="ghost" href="/keys">🔑 Keys</a>
 			<a class="ghost" href="/">← Back to chat</a>
 		</div>
 	</header>
