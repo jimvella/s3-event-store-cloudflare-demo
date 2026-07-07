@@ -1,123 +1,96 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import type { EventEnvelope, WireFeedPage, WireHead } from '@jimvella/s3-event-store';
-	import {
-		base64ToBytes,
-		decryptField,
-		importAesKey,
-		isEncryptedField,
-		type EncryptedField,
-		type WireKeyring
-	} from '$lib/crypto';
-	import type { Message, StoredText } from '$lib/types';
+	import { isEncryptedField, type EncryptedField } from '$lib/crypto';
+	import { clearKeyCache, decryptFor } from '$lib/keyringClient';
+	import { ROOM_STREAM, type StoredText } from '$lib/types';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
 
 	const me = data.username ?? '';
-	const STREAM = 'chat:general';
-	const EVENTS_URL = `/streams/${encodeURIComponent(STREAM)}/events`;
-	const HEAD_URL = `/streams/${encodeURIComponent(STREAM)}/head`;
+	const mySubject = data.mySubject;
+	const EVENTS_URL = `/streams/${encodeURIComponent(ROOM_STREAM)}/events`;
+	const HEAD_URL = `/streams/${encodeURIComponent(ROOM_STREAM)}/head`;
 
 	type ClientEvent = { id: string; type: string; data: Record<string, unknown> };
 
 	/**
-	 * A message as the client renders it. The feed only ever carries ciphertext
-	 * (model B — the server never decrypts), so alongside the projection fields
-	 * we track the current ciphertext envelope, the locally decrypted plaintext,
-	 * and whether decryption failed closed (author crypto-shredded).
+	 * A message as the client renders it. Events identify the author by opaque
+	 * `subject`; the name and the text are ciphertext (model B — the server
+	 * never decrypts), so alongside the projection fields we track each
+	 * envelope, its locally decrypted value, and whether decryption failed
+	 * closed (author crypto-shredded).
 	 */
-	type ViewMessage = Omit<Message, 'text'> & {
-		/** Ciphertext envelope of the current text; null for legacy plaintext. */
+	type ViewMessage = {
+		id: string;
+		subject: string;
+		seq: number;
+		postedAt: string;
+		editedAt: string | null;
+		deleted: boolean;
+		/** Ciphertext envelopes; null when the stored value is legacy plaintext. */
+		nameCipher: EncryptedField | null;
 		cipher: EncryptedField | null;
-		/** Locally decrypted text ('' while decryption is pending). */
+		/** Locally decrypted values ('' while decryption is pending). */
+		name: string;
 		plain: string;
-		/** Fail-closed marker: no key can be delivered for this ciphertext. */
+		/** Fail-closed markers: no key can be delivered for this ciphertext. */
+		nameErased: boolean;
 		erased: boolean;
 	};
 
-	function toView(m: Omit<Message, 'text'>, text: StoredText): ViewMessage {
-		const enc = isEncryptedField(text);
+	function toView(
+		m: { id: string; subject: string; seq: number; postedAt: string; editedAt: string | null; deleted: boolean },
+		username: StoredText,
+		text: StoredText
+	): ViewMessage {
 		return {
 			...m,
-			cipher: enc ? text : null,
-			plain: enc ? '' : (text as string),
+			nameCipher: isEncryptedField(username) ? username : null,
+			name: typeof username === 'string' ? username : '',
+			nameErased: false,
+			cipher: isEncryptedField(text) ? text : null,
+			plain: typeof text === 'string' ? text : '',
 			erased: false
 		};
 	}
 
 	// Client-side read model: the array is the source of truth, kept sorted by seq.
-	let messages = $state<ViewMessage[]>(data.messages.map((m) => toView(m, m.text)));
+	let messages = $state<ViewMessage[]>(data.messages.map((m) => toView(m, m.username, m.text)));
 	let cursor = $state<number>(data.cursor);
 
-	// -------------------------------------------------------------------------
-	// Local decryption (model B)
-	// -------------------------------------------------------------------------
-	//
-	// Keyrings are fetched per author from `/keys/{username}/keyring` and the
-	// keys imported into non-extractable WebCrypto handles, cached by keyId.
-	// A keyId the cached keyring doesn't know triggers ONE fresh fetch (deduped
-	// across concurrent misses); if the key still isn't deliverable, the
-	// message renders as erased — decryption fails closed, never shows stale
-	// plaintext. A periodic refresh re-fetches keyrings so a shred (or a
-	// cancellation) done elsewhere converges in every open tab.
-
-	const keyCache = new Map<string, Map<string, CryptoKey>>();
-	const keyringFetches = new Map<string, Promise<Map<string, CryptoKey>>>();
-
-	function loadKeyring(username: string): Promise<Map<string, CryptoKey>> {
-		let p = keyringFetches.get(username);
-		if (!p) {
-			p = (async () => {
-				const keys = new Map<string, CryptoKey>();
-				try {
-					const res = await fetch(`/keys/${encodeURIComponent(username)}/keyring`, {
-						cache: 'no-store'
-					});
-					if (res.ok) {
-						const { keyring } = (await res.json()) as WireKeyring;
-						for (const e of keyring) keys.set(e.keyId, await importAesKey(base64ToBytes(e.key)));
-					}
-				} catch {
-					/* transient — treated as an empty keyring; the refresh loop retries */
-				}
-				keyCache.set(username, keys);
-				return keys;
-			})().finally(() => keyringFetches.delete(username));
-			keyringFetches.set(username, p);
-		}
-		return p;
-	}
-
-	/** Decrypt a message's current ciphertext in place, failing closed. */
+	/** Decrypt a message's name and text in place via the author's keyring
+	 * (`$lib/keyringClient`), failing closed per field. */
 	async function decryptMessage(m: ViewMessage) {
+		const jobs: Promise<void>[] = [];
+		const nameCipher = m.nameCipher;
+		if (nameCipher) {
+			jobs.push(
+				decryptFor(m.subject, ROOM_STREAM, 'username', nameCipher).then((v) => {
+					if (m.nameCipher !== nameCipher) return;
+					m.nameErased = v === null;
+					m.name = v ?? '';
+				})
+			);
+		}
 		const cipher = m.cipher;
-		if (!cipher || m.deleted) return;
-		let keys = keyCache.get(m.username) ?? (await loadKeyring(m.username));
-		let key = keys.get(cipher.keyId);
-		if (!key) {
-			keys = await loadKeyring(m.username); // one fresh look before giving up
-			key = keys.get(cipher.keyId);
+		if (cipher && !m.deleted) {
+			jobs.push(
+				decryptFor(m.subject, ROOM_STREAM, 'text', cipher).then((v) => {
+					if (m.cipher !== cipher || m.deleted) return; // edited/deleted meanwhile
+					m.erased = v === null;
+					m.plain = v ?? '';
+				})
+			);
 		}
-		if (m.cipher !== cipher || m.deleted) return; // edited/deleted while we fetched
-		if (!key) {
-			m.erased = true;
-			m.plain = '';
-			return;
-		}
-		try {
-			m.plain = await decryptField(key, STREAM, 'text', cipher);
-			m.erased = false;
-		} catch {
-			m.erased = true; // wrong key or tampered ciphertext — never show garbage
-			m.plain = '';
-		}
+		await Promise.all(jobs);
 	}
 
 	/** Drop cached keyrings and re-decrypt everything — how a shred done in
 	 * another tab (or its cancellation) becomes visible here. */
 	async function refreshKeys() {
-		keyCache.clear();
+		clearKeyCache();
 		await Promise.all(messages.map(decryptMessage));
 	}
 
@@ -145,20 +118,27 @@
 	function applyEvent(e: EventEnvelope) {
 		const ts = e.meta?.ts ?? '';
 		if (e.type === 'MessagePosted') {
-			const d = e.data as { messageId: string; username: string; text: StoredText };
+			const d = e.data as {
+				messageId: string;
+				subject?: string;
+				username: StoredText;
+				text: StoredText;
+			};
 			if (!messages.some((m) => m.id === d.messageId)) {
-				const m = toView(
-					{
-						id: d.messageId,
-						username: d.username,
-						seq: e.version,
-						postedAt: ts,
-						editedAt: null,
-						deleted: false
-					},
-					d.text
+				messages.push(
+					toView(
+						{
+							id: d.messageId,
+							subject: d.subject ?? '',
+							seq: e.version,
+							postedAt: ts,
+							editedAt: null,
+							deleted: false
+						},
+						d.username,
+						d.text
+					)
 				);
-				messages.push(m);
 				void decryptMessage(messages[messages.length - 1]);
 			}
 		} else if (e.type === 'MessageEdited') {
@@ -452,10 +432,14 @@
 			<div class="empty">No messages yet — say something to append the first event.</div>
 		{/if}
 		{#each messages as m (m.id)}
-			{@const mine = m.username === me}
+			{@const mine = m.subject === mySubject}
 			<div class="row" class:mine>
 				<div class="bubble" class:mine class:deleted={m.deleted}>
-					{#if !mine}<div class="author">{m.username}</div>{/if}
+					{#if !mine}
+						<div class="author" class:anon={m.nameErased}>
+							{m.nameErased ? '🔒 erased user' : m.name || '…'}
+						</div>
+					{/if}
 
 					{#if m.deleted}
 						<div class="tombstone">🚫 This message was deleted</div>
@@ -617,6 +601,10 @@
 		font-weight: 700;
 		color: var(--accent);
 		margin-bottom: 0.15rem;
+	}
+	.author.anon {
+		color: var(--muted);
+		font-style: italic;
 	}
 	.text {
 		white-space: pre-wrap;

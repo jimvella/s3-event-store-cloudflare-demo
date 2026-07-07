@@ -20,16 +20,16 @@ import {
 import { r2BindingDriver, type R2BucketLike } from '@jimvella/s3-event-store/drivers/r2-binding';
 import { fieldEncryptingSerializer } from '$lib/server/fieldCrypto';
 import { getKeyStore, subjectForUsername } from '$lib/server/keys';
-import type {
-	ChatEventType,
-	Message,
-	MessageDeletedData,
-	MessageEditedData,
-	MessagePostedData
+import {
+	ROOM_STREAM,
+	type ChatEventType,
+	type Message,
+	type MessageDeletedData,
+	type MessageEditedData,
+	type MessagePostedData
 } from '$lib/types';
 
-/** The single global chat room maps to one event stream. */
-export const ROOM_STREAM = 'chat:general';
+export { ROOM_STREAM };
 
 /**
  * The store's chunk width N. Tiny so the demo shows several feed pages over a
@@ -70,11 +70,15 @@ export function getStore(env: App.Platform['env']): EventStore {
 		chunkSize: CHUNK_SIZE,
 		serializer: fieldEncryptingSerializer({
 			keys: getKeyStore(env),
+			// The ingress stamps the author's hashed subject into every event, so
+			// key selection reads it straight off the data — the identifier is
+			// plaintext by necessity, which is exactly why it must be non-PII.
 			subjectFor: (event) => {
-				const d = event.data as { username?: unknown };
-				return typeof d?.username === 'string' ? subjectForUsername(env, d.username) : null;
+				const d = event.data as { subject?: unknown };
+				return typeof d?.subject === 'string' ? d.subject : null;
 			},
-			encryptedFields: { MessagePosted: ['text'], MessageEdited: ['text'] }
+			// The author's NAME is personal data like the text — both encrypted.
+			encryptedFields: { MessagePosted: ['username', 'text'], MessageEdited: ['text'] }
 		})
 	});
 }
@@ -91,6 +95,7 @@ function applyEvent(map: Map<string, Message>, e: EventEnvelope): void {
 			const d = e.data as MessagePostedData;
 			map.set(d.messageId, {
 				id: d.messageId,
+				subject: d.subject ?? '', // absent on legacy events; backfilled below
 				username: d.username,
 				text: d.text,
 				seq: e.version,
@@ -121,8 +126,18 @@ function applyEvent(map: Map<string, Message>, e: EventEnvelope): void {
 	}
 }
 
-/** Fold the whole stream into the current list of messages plus a cursor. */
-export async function foldRoom(store: EventStore): Promise<{ messages: Message[]; cursor: number }> {
+/**
+ * Fold the whole stream into the current list of messages plus a cursor.
+ *
+ * Events written before subjects existed carry a plaintext `username` and no
+ * `subject`; the fold backfills the subject (same keyed hash the ingress
+ * stamps today) so everything downstream — ownership checks, keyring lookup,
+ * the Keys page — can rely on `subject` uniformly.
+ */
+export async function foldRoom(
+	store: EventStore,
+	env: App.Platform['env']
+): Promise<{ messages: Message[]; cursor: number }> {
 	const map = new Map<string, Message>();
 	let maxVersion = -1;
 	for await (const e of store.read(ROOM_STREAM)) {
@@ -130,6 +145,11 @@ export async function foldRoom(store: EventStore): Promise<{ messages: Message[]
 		applyEvent(map, e);
 	}
 	const messages = [...map.values()].sort((a, b) => a.seq - b.seq);
+	for (const m of messages) {
+		if (!m.subject && typeof m.username === 'string') {
+			m.subject = await subjectForUsername(env, m.username);
+		}
+	}
 	return { messages, cursor: maxVersion + 1 };
 }
 
@@ -150,12 +170,14 @@ function validateText(text: unknown): string {
 	return clean;
 }
 
-/** The submitted message must exist and belong to `username`. */
-function requireOwn(state: Map<string, Message>, messageId: unknown, username: string): Message {
+/** The submitted message must exist and belong to the acting user. Ownership
+ * is compared by SUBJECT — usernames are ciphertext in stored events, but the
+ * subject is exactly the stable plaintext identifier kept for this purpose. */
+function requireOwn(state: Map<string, Message>, messageId: unknown, subject: string): Message {
 	if (typeof messageId !== 'string' || !messageId) throw new CommandError(400, 'messageId is required');
 	const m = state.get(messageId);
 	if (!m) throw new CommandError(404, 'Message not found');
-	if (m.username !== username) throw new CommandError(403, 'You can only modify your own messages');
+	if (m.subject !== subject) throw new CommandError(403, 'You can only modify your own messages');
 	return m;
 }
 
@@ -170,7 +192,12 @@ function requireOwn(state: Map<string, Message>, messageId: unknown, username: s
  * into a spurious 409. `idempotentAppend` is the authority on duplicates; the
  * checks here are purely authorization + shape, all stable across a retry.
  */
-function authorizeEvent(raw: unknown, username: string, state: Map<string, Message>): EventInput {
+function authorizeEvent(
+	raw: unknown,
+	username: string,
+	subject: string,
+	state: Map<string, Message>
+): EventInput {
 	if (!raw || typeof raw !== 'object') throw new CommandError(400, 'Each event must be an object');
 	const { id, type, data } = raw as { id?: unknown; type?: unknown; data?: unknown };
 
@@ -188,6 +215,7 @@ function authorizeEvent(raw: unknown, username: string, state: Map<string, Messa
 		const text = validateText(d.text);
 		state.set(d.messageId, {
 			id: d.messageId,
+			subject,
 			username,
 			text,
 			seq: -1,
@@ -195,22 +223,22 @@ function authorizeEvent(raw: unknown, username: string, state: Map<string, Messa
 			editedAt: null,
 			deleted: false
 		});
-		return { id, type, data: { messageId: d.messageId, username, text } };
+		// The server stamps `subject` (the acting user's, enforced above) so the
+		// event is self-describing for the encrypting serializer; `username`
+		// goes in as plaintext here and leaves the serializer as ciphertext.
+		return { id, type, data: { messageId: d.messageId, subject, username, text } };
 	}
 
 	if (type === 'MessageEdited') {
-		const m = requireOwn(state, d.messageId, username);
+		const m = requireOwn(state, d.messageId, subject);
 		if (m.deleted) throw new CommandError(409, 'Cannot edit a deleted message');
 		const text = validateText(d.text);
 		m.text = text;
-		// Stamp the owner (== the acting user, enforced above) so the event is
-		// self-describing: the encrypting serializer derives the key subject
-		// from the event alone, without projection state.
-		return { id, type, data: { messageId: m.id, username, text } };
+		return { id, type, data: { messageId: m.id, subject, text } };
 	}
 
 	// MessageDeleted
-	const m = requireOwn(state, d.messageId, username);
+	const m = requireOwn(state, d.messageId, subject);
 	m.deleted = true;
 	return { id, type, data: { messageId: m.id } };
 }
@@ -235,6 +263,7 @@ export interface AppendOutcome {
  */
 export async function appendEvents(
 	store: EventStore,
+	env: App.Platform['env'],
 	username: string,
 	events: unknown,
 	expectedVersion: number | 'noStream'
@@ -243,9 +272,10 @@ export async function appendEvents(
 		throw new CommandError(400, '`events` must be a non-empty array');
 	}
 	// Fold once to a working state, then authorize each event against it.
-	const { messages } = await foldRoom(store);
+	const subject = await subjectForUsername(env, username);
+	const { messages } = await foldRoom(store, env);
 	const state = new Map(messages.map((m) => [m.id, { ...m }]));
-	const inputs = events.map((e) => authorizeEvent(e, username, state));
+	const inputs = events.map((e) => authorizeEvent(e, username, subject, state));
 
 	const res = await idempotentAppend(store, ROOM_STREAM, inputs, { expectedVersion });
 	return res.outcome === 'appended'

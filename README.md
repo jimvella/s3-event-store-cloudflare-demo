@@ -12,10 +12,12 @@ immutable event appended to a single append-only stream (`chat:general`). The
 message list you see is a *projection* (fold) of that event log, so the full
 history is always preserved: a delete is a tombstone event, not a mutation.
 
-Message text is **field-level encrypted** under a per-user key, and users can
-**crypto-shred** themselves: destroy the key and every copy of their words —
-in the log, in backups, in immutable edge caches — becomes permanently
-unreadable. See [Field-level encryption & crypto-shredding](#field-level-encryption--crypto-shredding).
+Message text **and author names** are **field-level encrypted** under a
+per-user key — events carry only an opaque hashed `subject`, so a raw fold of
+the log is pseudonymous by default — and users can **crypto-shred**
+themselves: destroy the key and every copy of their words and name — in the
+log, in backups, in immutable edge caches — becomes permanently unreadable.
+See [Field-level encryption & crypto-shredding](#field-level-encryption--crypto-shredding).
 
 There's no authentication — you just pick a username (stored in a cookie).
 
@@ -81,7 +83,7 @@ teach the library's HTTP model:
 | `POST`   | `/streams/chat:general/events` | **raw append** — client-built events (idempotent) |
 | `GET`    | `/streams/chat:general/events?from=` | the library's paginated feed (ciphertext out) |
 | `GET`    | `/streams/chat:general/head` | the pollable head resource (ETag / 304) |
-| `GET`    | `/keys/{username}/keyring` | keyring delivery — decryption keys, `no-store` |
+| `GET`    | `/keys/{subject}/keyring` | keyring delivery — decryption keys, `no-store` |
 | `POST`   | `/api/keys/rotate` | mint your next key generation |
 | `POST`   | `/api/shred` · `/api/shred/cancel` | request / cancel crypto-shredding of your account |
 | `POST`   | `/api/shred/sweep` | run the shred sweeper (a cron in production) |
@@ -139,25 +141,38 @@ key layer end to end, with one demo-owned twist:
   stream has one owner. A shared chat room is the other shape: one stream,
   many authors. So the demo implements a small **field-level serializer** on
   the library's public `PayloadSerializer` seam (`src/lib/server/fieldCrypto.ts`):
-  only `text` is encrypted (AES-256-GCM, fresh random 96-bit nonce, AAD
-  binding the ciphertext to its stream + field), under the **author's** key,
-  with the key generation recorded per field:
+  the sensitive fields — the message `text` **and the author's `username`** —
+  are encrypted (AES-256-GCM, fresh random 96-bit nonce, AAD binding each
+  ciphertext to its stream + field) under the **author's** key, with the key
+  generation recorded per field:
 
   ```jsonc
-  { "messageId": "…", "username": "alice",
-    "text": { "$enc": "AES-256-GCM", "keyId": "000000", "iv": "…", "ct": "…" } }
+  { "messageId": "…",
+    "subject":  "9a8fea83b3eb7025d065919f69cec7e7",
+    "username": { "$enc": "AES-256-GCM", "keyId": "000000", "iv": "…", "ct": "…" },
+    "text":     { "$enc": "AES-256-GCM", "keyId": "000000", "iv": "…", "ct": "…" } }
   ```
 
-  `username` and `messageId` stay plaintext, so authorization and the
-  projection never need a key — and shredding one author erases exactly their
-  words, nobody else's.
+  Shredding one author erases exactly their words *and their name*, nobody
+  else's.
 
-- **Key subjects are keyed hashes, not usernames.** Identifiers in object
-  keys and audit events live forever *outside* the encryption boundary, so
-  they must not be PII: the subject is `HMAC-SHA-256(pepper, username)`
-  (truncated to 128 bits) under a server-held pepper — deterministic for key
-  lookup, non-reversible even by dictionary. Clients never see subjects; the
-  keyring route takes a username and maps it server-side.
+- **Identifiers vs. attributes.** The one plaintext author field is
+  `subject` — `HMAC-SHA-256(pepper, username)`, truncated to 128 bits, under
+  a server-held pepper, stamped by the ingress. The split is load-bearing:
+  key selection, ownership checks, and projection grouping all need a
+  *stable identifier* **before any key is available**, so that field cannot
+  be encrypted — which is precisely why it must be non-PII by construction
+  (deterministic for lookup, non-reversible even by dictionary). Everything
+  human-readable is an encrypted *attribute*. The same rule the library
+  states for stream IDs ("identifiers live forever outside the encryption
+  boundary — no PII"), applied inside the event body.
+
+  A pleasant consequence: **a raw fold of the log is pseudonymous by
+  default**. Test fixtures, analytics, and replication targets see opaque
+  subjects and ciphertext names — anonymisation almost for free; identity
+  exists only where keyring access is granted. (Erasure still has honest
+  limits: *that* subject `9a8f…` posted N messages at these timestamps
+  survives forever — shredding destroys content and linkage, not existence.)
 
 - **Key management lives under a prefix of the same bucket.** The library's
   `createS3KeyStore` takes any `StorageDriver`, so a ~25-line prefix-rebasing
@@ -173,12 +188,14 @@ key layer end to end, with one demo-owned twist:
   choice. If the server decrypted, plaintext would sit in edge caches that
   serve immutable pages *forever* — the exact erasure failure shredding
   exists to prevent. Instead the feed serves stored ciphertext verbatim (the
-  serializer's `deserialize` is a passthrough), and the chat fetches each
-  author's keyring (`GET /keys/{username}/keyring`, `no-store`), imports the
-  keys with WebCrypto, and decrypts locally. Decryption **fails closed**: a
-  message whose key can't be delivered renders as
-  *“🔒 Erased — the author's encryption key has been destroyed”*, never as
-  stale plaintext or garbage.
+  serializer's `deserialize` is a passthrough), and the client fetches each
+  subject's keyring (`GET /keys/{subject}/keyring`, `no-store`), imports the
+  keys with WebCrypto, and decrypts locally (`src/lib/keyringClient.ts`,
+  shared by the chat and the Keys page — even the Keys page resolves names in
+  the browser rather than granting the render path a decrypt capability).
+  Decryption **fails closed**: a message whose key can't be delivered renders
+  as *“🔒 Erased”* with an *“erased user”* author label, never as stale
+  plaintext or garbage.
 
 - **The shred workflow is the library's, verbatim.** `POST /api/shred` calls
   `requestShred`: a `ShredRequested` **intent** is appended to the
@@ -208,12 +225,14 @@ rendered as a table. A good demo script:
    ciphertext is still in the log and the edge cache. *Delete hides; it
    doesn't erase.*
 3. As alice, hit **Request shred**: every alice message everywhere renders
-   erased within seconds, posting returns 410, and `ShredRequested` lands on
-   the audit stream. Run the sweeper early — alice shows up in
-   `openSubjects`, untouched. **Cancel** — her messages come back.
-4. Shred again, wait out the 60s, run the sweeper: `keystore/keys/{alice}/…`
+   erased — text *and* author name — within seconds, posting returns 410, and
+   `ShredRequested` lands on the audit stream. Run the sweeper early — alice
+   shows up in `openSubjects`, untouched. **Cancel** — her messages come back.
+4. Shred again, wait out the 60s, run the sweeper: `keystore/keys/{subject}/…`
    disappears from the bucket, `ShredCompleted` lands, and the log's
-   ciphertext is now permanently unreadable. Log out — the username is burned.
+   ciphertext is now permanently unreadable — alice is an anonymous subject
+   hash everywhere, including on the Keys page itself. Log out — the username
+   is burned.
 5. As bob, **Rotate key**: gen `000001` appears; his old messages decrypt
    under `000000`, new ones carry `keyId: "000001"` — generational keys,
    visible per field.
@@ -291,8 +310,9 @@ the library's own endpoints.
 ```
 src/
   lib/
-    types.ts               shared read-model + event-data types
+    types.ts               shared read-model + event-data types (subject = the plaintext identifier)
     crypto.ts              field-envelope format + WebCrypto encrypt/decrypt (isomorphic)
+    keyringClient.ts       browser keyring fetch/cache + fail-closed field decryption
     server/store.ts        store wiring (chunkSize 5, encrypting serializer), projection, raw-append ingress, edge-cache helpers
     server/fieldCrypto.ts  the field-level encrypting serializer (PayloadSerializer seam)
     server/keys.ts         key store under keystore/ (prefixedDriver), subject hashing, shred context
@@ -304,7 +324,7 @@ src/
     api/+page.svelte       the API browser (interactive endpoint catalog)
     store/                 the Storage view (raw R2 objects + reset button)
     keys/+page.svelte      the Keys view (generations, tombstones, shred/rotate/sweep, audit log)
-    keys/[username]/keyring/+server.ts  GET keyring delivery (model B, no-store)
+    keys/[subject]/keyring/+server.ts   GET keyring delivery (model B, no-store)
     streams/[stream]/events/+server.ts  GET feed (readPage, edge-cached) + POST raw append (idempotentAppend)
     streams/[stream]/head/+server.ts    GET pollable head resource (readHead)
     api/store/             GET list · GET object · DELETE wipe+flush

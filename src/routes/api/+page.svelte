@@ -81,10 +81,10 @@
 		{
 			id: 'keyring',
 			method: 'GET',
-			path: '/keys/{username}/keyring',
+			path: '/keys/{subject}/keyring',
 			title: 'Keyring delivery — the decryption keys (model B)',
-			desc: 'Every key generation a user has, base64, served no-store (contrast with the immutable ciphertext feed pages). The browser decrypts message text locally with these. The username maps to a hashed subject server-side. Once a shred is requested, this returns an EMPTY keyring — that is the instant, everywhere-at-once soft delete.',
-			fields: [{ name: 'username', label: 'username', kind: 'path', default: me }]
+			desc: "Every key generation a subject has, base64, served no-store (contrast with the immutable ciphertext feed pages). Addressed by the opaque subject that events carry — the only plaintext author identifier; the username itself is one of the encrypted fields these keys unlock. Once a shred is requested, this returns an EMPTY keyring — the instant, everywhere-at-once soft delete. Prefilled with YOUR subject.",
+			fields: [{ name: 'subject', label: 'subject (hashed)', kind: 'path', default: data.mySubject }]
 		},
 		{
 			id: 'rotate',

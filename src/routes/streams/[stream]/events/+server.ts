@@ -99,7 +99,7 @@ export const POST: RequestHandler = async ({ params, request, url, platform, loc
 
 	const store = getStore(platform.env);
 	try {
-		const result = await appendEvents(store, locals.username, body.events, expectedVersion);
+		const result = await appendEvents(store, platform.env, locals.username, body.events, expectedVersion);
 
 		if (result.outcome === 'appended') {
 			// The head moved — purge its edge-cached copy so the next poll (in this

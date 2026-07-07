@@ -2,6 +2,8 @@
 	import { onMount } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import type { SweepReport, Tombstone } from '@jimvella/s3-event-store';
+	import { decryptFor } from '$lib/keyringClient';
+	import { ROOM_STREAM } from '$lib/types';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -20,10 +22,32 @@
 		return () => clearInterval(t);
 	});
 
-	const mine = $derived(data.subjects.find((s) => s.username === data.me));
+	const mine = $derived(data.subjects.find((s) => s.subject === data.mySubject));
+
+	// The page data is pseudonymous (subjects + ciphertext names, like any raw
+	// consumer of the log); names resolve in the BROWSER through keyring
+	// delivery. A shredded subject's name is unrecoverable — it renders as an
+	// erased user, which is the anonymisation working as intended.
+	let names = $state<Record<string, string | null>>({});
+	$effect(() => {
+		const subjects = data.subjects;
+		void (async () => {
+			const next: Record<string, string | null> = {};
+			await Promise.all(
+				subjects.map(async (s) => {
+					next[s.subject] =
+						s.name ??
+						(s.nameCipher ? await decryptFor(s.subject, ROOM_STREAM, 'username', s.nameCipher) : null);
+				})
+			);
+			names = next;
+		})();
+	});
 
 	function nameOf(subjectId: string): string {
-		return data.subjects.find((s) => s.subject === subjectId)?.username ?? `${subjectId.slice(0, 12)}…`;
+		const n = names[subjectId];
+		if (n === undefined) return `${subjectId.slice(0, 12)}…`; // still resolving
+		return n ?? '🔒 erased user';
 	}
 
 	function remainingMs(t: Tombstone): number {
@@ -96,18 +120,21 @@
 
 	<div class="body">
 		<p class="note">
-			Every message's <code>text</code> is AES-256-GCM ciphertext under its author's current key
-			(field-level: <code>username</code> and <code>messageId</code> stay plaintext). The feed and
-			the edge cache only ever hold ciphertext — the browser decrypts with keys fetched from
-			<code>/keys/&lbrace;username&rbrace;/keyring</code>. <strong>Deleting a message hides it;
-			shredding a user's key erases their words everywhere at once</strong> — including from
-			immutable pages already cached at the edge and from every backup of the bucket.
+			Every message's <code>text</code> <em>and</em> <code>username</code> are AES-256-GCM
+			ciphertext under the author's current key; the only plaintext author identifier is the
+			opaque <code>subject</code> (so a raw fold of the log is pseudonymous by default — free
+			anonymisation for analytics and test fixtures). The feed and the edge cache only ever hold
+			ciphertext — the browser decrypts with keys fetched from
+			<code>/keys/&lbrace;subject&rbrace;/keyring</code>. <strong>Deleting a message hides it;
+			shredding a user's key erases their words <em>and their name</em> everywhere at once</strong>
+			— including from immutable pages already cached at the edge and from every backup of the
+			bucket.
 		</p>
 
 		{#if mine}
 			<section class="card">
 				<div class="cardhead">
-					<h2>Your account — <strong>{mine.username}</strong></h2>
+					<h2>Your account — <strong>{data.me}</strong></h2>
 					<div class="btns">
 						<button
 							class="pill"
@@ -163,7 +190,7 @@
 			{#each data.subjects as s (s.subject)}
 				<div class="subject">
 					<div class="subjecthead">
-						<strong>{s.username}</strong>
+						<strong>{nameOf(s.subject)}</strong>
 						<code class="mono dim">{s.subject}</code>
 						{#if s.tombstone === null || s.tombstone.state === 'cancelled'}
 							<span class="chip live">live</span>
