@@ -1,5 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { ROOM_STREAM } from '$lib/types';
+	import { decryptJsonText } from '$lib/decryptView';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -31,7 +33,8 @@
 		url: string;
 		reqBody: string | null;
 		curl: string;
-		body: string;
+		body: string; // pretty-printed (or raw when not JSON)
+		rawText: string; // the response body verbatim
 		headers: [string, string][]; // notable response headers to display
 		etag: string | null; // ETag response header, if any
 		prev: string | null; // feed page link (from the JSON body)
@@ -125,6 +128,13 @@
 	let results = $state<Record<string, Result | undefined>>({});
 	let busy = $state<Record<string, boolean>>({});
 
+	// Per-response view toggles. Pretty-print is on by default; Decrypt fetches
+	// keyrings and rewrites encrypted fields to plaintext in the browser (the
+	// server never decrypts — model B), so a shredded field shows as erased.
+	let respPretty = $state<Record<string, boolean>>({});
+	let respDecrypt = $state<Record<string, boolean>>({});
+	let respDecrypted = $state<Record<string, string>>({});
+
 	for (const ep of ENDPOINTS) {
 		inputs[ep.id] = {};
 		for (const f of ep.fields) inputs[ep.id][f.name] = f.default ?? '';
@@ -187,6 +197,10 @@
 	async function run(ep: Endpoint) {
 		if (ep.danger && !confirm(`Really send ${ep.method} ${ep.path}?`)) return;
 		const { url, reqBody, headers } = build(ep);
+		// Reset the response view for this fresh request.
+		respPretty[ep.id] = respPretty[ep.id] ?? true;
+		respDecrypt[ep.id] = false;
+		respDecrypted[ep.id] = '';
 		busy[ep.id] = true;
 		const started = performance.now();
 		try {
@@ -220,6 +234,7 @@
 				reqBody: reqBody ? prettyMaybe(reqBody) : null,
 				curl: toCurl(ep, url, reqBody, headers),
 				body: pretty,
+				rawText: text,
 				headers: shown,
 				etag: res.headers.get('etag'),
 				prev: j?.prev ?? null,
@@ -236,6 +251,7 @@
 				reqBody,
 				curl: toCurl(ep, url, reqBody, headers),
 				body: String(e),
+				rawText: String(e),
 				headers: [],
 				etag: null,
 				prev: null,
@@ -245,6 +261,23 @@
 		} finally {
 			busy[ep.id] = false;
 		}
+	}
+
+	/** The response body to display: decrypted (if toggled and ready), else
+	 * pretty-printed or raw per the Pretty toggle. */
+	function displayedBody(ep: Endpoint): string {
+		const r = results[ep.id];
+		if (!r) return '';
+		if (respDecrypt[ep.id]) return respDecrypted[ep.id] || 'Decrypting…';
+		return respPretty[ep.id] === false ? r.rawText : r.body;
+	}
+
+	/** Decrypt the response's encrypted fields in the browser (model B). */
+	async function maybeDecrypt(ep: Endpoint) {
+		if (!respDecrypt[ep.id]) return;
+		const r = results[ep.id];
+		if (!r) return;
+		respDecrypted[ep.id] = await decryptJsonText(r.rawText, ROOM_STREAM);
 	}
 
 	/** Replay a request with `If-None-Match` set to the ETag we just got — the 304 poll. */
@@ -397,7 +430,19 @@
 							</div>
 						{/if}
 
-						{#if r.body}<pre class="mono resp">{r.body}</pre>{/if}
+						{#if r.body}
+							<div class="resptoggles">
+								<label class="toggle">
+									<input type="checkbox" bind:checked={respPretty[ep.id]} disabled={respDecrypt[ep.id]} />
+									Pretty-print JSON
+								</label>
+								<label class="toggle">
+									<input type="checkbox" bind:checked={respDecrypt[ep.id]} onchange={() => maybeDecrypt(ep)} />
+									Decrypt
+								</label>
+							</div>
+							<pre class="mono resp">{displayedBody(ep)}</pre>
+						{/if}
 
 						{#if ep.id === 'head' && r.etag}
 							<div class="actions">
@@ -728,6 +773,20 @@
 	}
 	.req {
 		margin-bottom: 0.2rem;
+	}
+	.resptoggles {
+		display: flex;
+		gap: 1rem;
+		margin: 0.3rem 0 0.4rem;
+	}
+	.toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.3rem;
+		font-size: 0.72rem;
+		color: var(--muted);
+		cursor: pointer;
+		user-select: none;
 	}
 
 	@media (max-width: 640px) {

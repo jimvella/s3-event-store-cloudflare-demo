@@ -1,5 +1,7 @@
 <script lang="ts">
 	import type { StoreObject, StoreObjectBody } from '$lib/server/browser';
+	import { ROOM_STREAM } from '$lib/types';
+	import { decryptJsonText } from '$lib/decryptView';
 	import type { PageData } from './$types';
 
 	let { data }: { data: PageData } = $props();
@@ -8,6 +10,8 @@
 	let selected = $state<StoreObjectBody | null>(null);
 	let selectedKey = $state<string | null>(null);
 	let pretty = $state(false);
+	let decrypt = $state(false);
+	let decryptedText = $state('');
 	let loading = $state(false);
 	let wiping = $state(false);
 	let err = $state<string | null>(null);
@@ -28,12 +32,28 @@
 
 	const shown = $derived.by(() => {
 		if (!selected) return '';
+		if (decrypt) return decryptedText || 'Decrypting…';
 		if (!pretty) return selected.text;
 		try {
 			return JSON.stringify(JSON.parse(selected.text), null, 2);
 		} catch {
 			return selected.text;
 		}
+	});
+
+	// Decryption is async (it fetches keyrings), so it can't live in a $derived.
+	// Recompute whenever the selected object or the decrypt toggle changes; a
+	// token guards against an older object's decrypt landing after a newer
+	// selection. The server never sees plaintext — this is model-B decryption
+	// in the browser, so a crypto-shredded field shows here as erased too.
+	$effect(() => {
+		const sel = selected;
+		if (!sel || !decrypt) return;
+		const key = sel.key;
+		decryptedText = '';
+		decryptJsonText(sel.text, ROOM_STREAM).then((t) => {
+			if (selected?.key === key && decrypt) decryptedText = t;
+		});
 	});
 
 	async function select(key: string) {
@@ -154,8 +174,12 @@
 						<span>etag {selected.etag}</span>
 						<span>{fmtTime(selected.uploaded)}</span>
 						<label class="toggle">
-							<input type="checkbox" bind:checked={pretty} />
+							<input type="checkbox" bind:checked={pretty} disabled={decrypt} />
 							Pretty-print JSON
+						</label>
+						<label class="toggle">
+							<input type="checkbox" bind:checked={decrypt} />
+							Decrypt
 						</label>
 					</div>
 				</div>
