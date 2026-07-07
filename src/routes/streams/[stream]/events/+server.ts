@@ -74,11 +74,8 @@ export const GET: RequestHandler = async ({ params, url, platform, locals }) => 
  *   - a lost-response retry already committed them → 200 { outcome: "alreadyCommitted" }
  *   - a genuine concurrent writer took the slot     → 409 { headVersion } (re-read + retry)
  *
- * When the append seals a bucket (`compactionSuggested`), we compact it via
- * `ctx.waitUntil` — the same invocation keeps running after the response to
- * fold that bucket's commits into a chunk object. It's safe to fire sloppily:
- * `compactStream` does at most one bucket per call and no-ops if there's
- * nothing to do, and racing compactors stand down.
+ * The store uses the default mutable-tail strategy, so an append is complete
+ * when it returns — no sealed bucket to compact, no background `waitUntil` work.
  */
 export const POST: RequestHandler = async ({ params, request, url, platform, locals }) => {
 	if (!locals.username) throw error(401, 'Not logged in');
@@ -111,14 +108,6 @@ export const POST: RequestHandler = async ({ params, request, url, platform, loc
 					cache.delete(key).catch(() => {});
 				}
 			}
-		}
-
-		if (result.compactionSuggested) {
-			// Background compaction: starts now, survives past the response via
-			// waitUntil (in dev there's no ctx, but the promise still runs to
-			// completion in the Node process).
-			const job = store.compactStream(ROOM_STREAM).catch(() => {});
-			platform.ctx?.waitUntil?.(job);
 		}
 
 		return json(result, { status: result.outcome === 'appended' ? 201 : 200 });

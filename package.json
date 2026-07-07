@@ -23,6 +23,6 @@
     "wrangler": "^4.107.0"
   },
   "dependencies": {
-    "@jimvella/s3-event-store": "^0.2.0"
+    "@jimvella/s3-event-store": "^0.3.0"
   }
 }

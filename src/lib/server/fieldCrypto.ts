@@ -57,7 +57,7 @@ export function fieldEncryptingSerializer(config: FieldEncryptingConfig): Payloa
 				data[field] = await encryptField(key, keyId, streamId, field, value);
 			}
 			// Stamp the envelope's reserved keyId too — the generation that
-			// encrypted this event, plaintext metadata compaction copies verbatim.
+			// encrypted this event, stored verbatim and never re-encrypted.
 			return { data, keyId };
 		},
 

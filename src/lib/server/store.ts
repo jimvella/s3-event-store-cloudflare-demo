@@ -55,6 +55,12 @@ export class CommandError extends Error {
 /**
  * Build an EventStore backed by the Worker's R2 binding.
  *
+ * Storage strategy: the library's default **mutable tail**. A stream is a
+ * sequence of chunk objects and the newest is updated in place by a CAS PUT;
+ * once it fills (at `chunkSize` commits) it seals and the next append mints the
+ * following chunk. There are no per-commit objects and no background
+ * compaction — an append is complete when it returns.
+ *
  * The serializer is the library's encryption seam: on append it encrypts each
  * event's `text` field under its author's key (field-level — `username` and
  * `messageId` stay plaintext), and on read it passes the stored ciphertext
@@ -250,13 +256,6 @@ function authorizeEvent(
 export interface AppendOutcome {
 	outcome: 'appended' | 'alreadyCommitted';
 	nextExpectedVersion: number;
-	/**
-	 * The library's write-driven compaction trigger: true when this append sealed
-	 * an uncompacted bucket behind the head. The endpoint fires
-	 * `compactStream` on it via `waitUntil`. Never set on the alreadyCommitted
-	 * path (the original attempt already fired it).
-	 */
-	compactionSuggested: boolean;
 }
 
 /**
@@ -286,16 +285,8 @@ export async function appendEvents(
 
 	const res = await idempotentAppend(store, ROOM_STREAM, inputs, { expectedVersion });
 	return res.outcome === 'appended'
-		? {
-				outcome: 'appended',
-				nextExpectedVersion: res.result.nextExpectedVersion,
-				compactionSuggested: res.result.compactionSuggested
-			}
-		: {
-				outcome: 'alreadyCommitted',
-				nextExpectedVersion: res.nextExpectedVersion,
-				compactionSuggested: false
-			};
+		? { outcome: 'appended', nextExpectedVersion: res.result.nextExpectedVersion }
+		: { outcome: 'alreadyCommitted', nextExpectedVersion: res.nextExpectedVersion };
 }
 
 /** Current head version of the room stream, or -1 if the stream is empty. */

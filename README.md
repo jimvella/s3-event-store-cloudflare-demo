@@ -104,24 +104,24 @@ This is the payoff: the chat is nothing but immutable JSON files in object
 storage:
 
 ```
-chat/streams/chat:general/e/000000000000.json      ← commit (one per append)
-chat/streams/chat:general/e/000000000001.json
-...
-chat/streams/chat:general/c/000000000000.json      ← chunk (a compacted bucket)
-chat/streams/chat:general/head.json                ← head pointer
-chat/streams/$system.key-audit/e/…                 ← key/shred audit stream
+chat/streams/chat:general/c/000000000000.json      ← chunk: commits 0–4 (the live tail while filling)
+chat/streams/chat:general/c/000000000005.json      ← next chunk, minted once the first sealed at N
+chat/streams/$system.key-audit/c/…                 ← key/shred audit stream
 users/{hmac(username)}.json                        ← account record: { userId } (the login index)
 keystore/keys/{userId}/000000.json                 ← wrapped data key, one per generation
 keystore/tombstones/{userId}.json                  ← shred state machine
 keystore/sweep/checkpoint.json                     ← the shred sweeper's cursor
 ```
 
-**Compaction** is wired via the library's write-driven trigger: when an append
-seals a bucket (`compactionSuggested`), the endpoint fires
-`store.compactStream()` in the background with `ctx.waitUntil` — the same
-invocation keeps running after the response. Once the head passes a `chunkSize`
-(5) boundary you'll watch the five `e/…` commit objects for that bucket collapse
-into a single `c/…` **chunk** object here; reads serve from it transparently.
+**Mutable-tail storage** is the library's default strategy: a stream is a
+sequence of `c/…` **chunk** objects, each holding up to `chunkSize` (5) commits.
+The newest chunk is the live *tail* — each append rewrites it in place with a
+compare-and-swap PUT — and once it fills it seals, immutable forever, and the
+next append mints the following chunk. So watch the tail object's byte count
+grow with every message, then a fresh `c/…` appear at the next N boundary. There
+are no per-commit objects, no separate head pointer (the head is derived from
+the tail chunk), and no background compaction — an append is done when it
+returns.
 
 A **🗑 Delete bucket & flush caches** button resets the demo: it deletes every
 object (`DELETE /api/store`) — including the key store and all shred
