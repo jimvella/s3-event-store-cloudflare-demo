@@ -103,7 +103,7 @@
 				<h1>Keys & crypto-shredding</h1>
 				<p class="sub">
 					Per-user data keys under <code>keystore/</code> in the same bucket — wrapped by a master
-					key, addressed by a <em>keyed hash</em> of the username, destroyed by the shred workflow.
+					key, addressed by a stable random <em>userId</em>, destroyed by the shred workflow.
 				</p>
 			</div>
 		</div>
@@ -182,9 +182,9 @@
 		<section class="card">
 			<h2>Subjects</h2>
 			<p class="cardnote">
-				A <em>subject</em> is the erasure unit: <code>HMAC-SHA-256(pepper, username)</code>,
-				truncated — deterministic for key lookup, but non-reversible, so no PII lands in object
-				keys or audit events. Users appear here once they've posted (generation 0 is minted
+				A <em>subject</em> is the erasure unit: a stable random <code>userId</code> minted at first login,
+				stored in the user directory (<code>users/</code>), the way a real app keeps it as a column on the account row
+				(opaque, no PII in object keys, and stable for life so a rename never disturbs the key hierarchy). Users appear here once they've posted (generation 0 is minted
 				lazily by the first encryption).
 			</p>
 			{#each data.subjects as s (s.subject)}

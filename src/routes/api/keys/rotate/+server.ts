@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
 import { SubjectErasedError } from '@jimvella/s3-event-store';
-import { getKeyStore, subjectForUsername } from '$lib/server/keys';
+import { ensureUserId, getKeyStore } from '$lib/server/keys';
 import type { RequestHandler } from './$types';
 
 /**
@@ -14,7 +14,7 @@ export const POST: RequestHandler = async ({ platform, locals }) => {
 	if (!locals.username) throw error(401, 'Not logged in');
 	if (!platform?.env) throw error(500, 'R2 binding unavailable');
 
-	const subject = await subjectForUsername(platform.env, locals.username);
+	const subject = await ensureUserId(platform.env, locals.username);
 	try {
 		const { keyId } = await getKeyStore(platform.env).rotate(subject);
 		return json({ subject, keyId });

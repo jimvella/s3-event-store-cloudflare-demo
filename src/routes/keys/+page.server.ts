@@ -2,12 +2,12 @@ import { error } from '@sveltejs/kit';
 import { AUDIT_STREAM, type Tombstone } from '@jimvella/s3-event-store';
 import { foldRoom, getStore } from '$lib/server/store';
 import {
+	ensureUserId,
 	getAuditStore,
 	getKeyDriver,
 	KEYSTORE_PREFIX,
 	readTombstone,
-	shredWaitingPeriodMs,
-	subjectForUsername
+	shredWaitingPeriodMs
 } from '$lib/server/keys';
 import { isEncryptedField, type EncryptedField } from '$lib/crypto';
 import type { PageServerLoad } from './$types';
@@ -58,7 +58,7 @@ export const load: PageServerLoad = async ({ platform, locals }) => {
 	if (!platform?.env) throw error(500, 'R2 binding unavailable — is wrangler configured?');
 	const env = platform.env;
 	const me = locals.username!;
-	const mySubject = await subjectForUsername(env, me);
+	const mySubject = await ensureUserId(env, me);
 
 	// One entry per subject seen in the projection, plus the session user (so
 	// the page has a "my account" card before their first message).

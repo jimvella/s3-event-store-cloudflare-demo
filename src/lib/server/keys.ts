@@ -15,12 +15,13 @@
 //      keystore/tombstones/{subject}.json       shred state machine
 //      keystore/sweep/checkpoint.json           the sweeper's audit-stream cursor
 //
-//  - WHAT: a subject is a chat user, identified by a *keyed hash* of the
-//    username — HMAC-SHA-256 under a server-held pepper, truncated to 128
-//    bits. Identifiers in object keys and audit events live forever outside
-//    the encryption boundary, so they must not be reversible: a bare SHA-256
-//    of a low-entropy username falls to a dictionary; the keyed hash doesn't.
-//    Only the server can map username → subject, which is exactly the point.
+//  - WHAT: a subject is a chat user, identified by a stable random `userId`
+//    minted at first login and STORED in a user directory (see below), the way
+//    a real app keeps it as a column on the account row. It must be stable for
+//    life (it names the key hierarchy, tombstone, and every event the user
+//    wrote) and non-PII (identifiers in object keys and audit events live
+//    forever outside the encryption boundary) — a hash of the mutable,
+//    low-entropy username satisfies neither, so we store a random id instead.
 
 import {
 	AUDIT_STREAM,
@@ -102,13 +103,30 @@ export function getKeyDriver(env: Env): StorageDriver {
 	return prefixedDriver(r2BindingDriver(env.EVENTS as unknown as R2BucketLike), KEYSTORE_PREFIX);
 }
 
-/**
- * subject := hex(HMAC-SHA-256(pepper, username))[0..32) — 128 bits, keyed.
- * Deterministic (the same user always maps to the same key hierarchy) but
- * non-reversible without the pepper, so no PII lands in object keys, audit
- * events, or the sweeper's checkpoint.
- */
-export async function subjectForUsername(env: Env, username: string): Promise<string> {
+// ---------------------------------------------------------------------------
+// User directory: username → stable userId
+// ---------------------------------------------------------------------------
+//
+// The key subject must be STABLE FOR LIFE — it names the key hierarchy, the
+// tombstone, and every event the user ever wrote — while a username is a
+// mutable, low-entropy attribute. So the subject is a random `userId` minted
+// once at first login and STORED, the way a real app keeps it as a column on
+// the account record; login does a lookup, not a derivation. The directory
+// record is the demo's stand-in for that account row:
+//
+//   users/{hmac(pepper, username)}.json  →  { "userId": "<32 hex>", "createdAt": … }
+//
+// The record's object key is a keyed hash (identifiers in object keys live
+// forever and must not be PII) and its body holds NO username: the only place
+// a name exists is encrypted inside events, so erasure covers it. The pepper
+// here only protects the login index — losing it strands the username→userId
+// mapping (returning users would mint fresh identities), but unlike a
+// derived-subject scheme it cannot orphan keys or ciphertext: events carry
+// their subject verbatim.
+
+/** Login-index key: hex(HMAC-SHA-256(pepper, username))[0..32). Keyed, so the
+ * directory's object keys don't disclose usernames even by dictionary. */
+async function usernameIndexHash(env: Env, username: string): Promise<string> {
 	const pepper = new TextEncoder().encode(env.SUBJECT_PEPPER ?? DEV_SUBJECT_PEPPER);
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -124,6 +142,50 @@ export async function subjectForUsername(env: Env, username: string): Promise<st
 		.map((b) => b.toString(16).padStart(2, '0'))
 		.join('')
 		.slice(0, 32);
+}
+
+/** Driver over the user directory ('users/' prefix of the event bucket). */
+function userDirectory(env: Env): StorageDriver {
+	return prefixedDriver(r2BindingDriver(env.EVENTS as unknown as R2BucketLike), 'users/');
+}
+
+/** The stored userId for a username, or null if never registered. */
+export async function resolveUserId(env: Env, username: string): Promise<string | null> {
+	const got = await userDirectory(env).get(`${await usernameIndexHash(env, username)}.json`);
+	return got.kind === 'found' ? (JSON.parse(got.body) as { userId: string }).userId : null;
+}
+
+/**
+ * Register-or-resolve at login: mint a random 128-bit userId and claim the
+ * directory record with a create-only PUT. Two concurrent first logins race
+ * safely — the loser's `putIfAbsent` reports `exists` and re-reads the
+ * winner's record, so a username can never map to two identities.
+ */
+export async function ensureUserId(env: Env, username: string): Promise<string> {
+	const dir = userDirectory(env);
+	const recordKey = `${await usernameIndexHash(env, username)}.json`;
+
+	const existing = await dir.get(recordKey);
+	if (existing.kind === 'found') return (JSON.parse(existing.body) as { userId: string }).userId;
+
+	const userId = [...crypto.getRandomValues(new Uint8Array(16))]
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join('');
+	const put = await dir.putIfAbsent(recordKey, JSON.stringify({ userId, createdAt: new Date().toISOString() }));
+	if (put.kind === 'created') return userId;
+
+	const won = await dir.get(recordKey);
+	if (won.kind !== 'found') throw new Error('user record vanished during registration race');
+	return (JSON.parse(won.body) as { userId: string }).userId;
+}
+
+/**
+ * LEGACY COMPAT: subjects used to be derived directly as hmac(username), so
+ * shreds from that era left their tombstones under the hash. Login checks it
+ * too, so a username burned before the userId migration stays burned.
+ */
+export async function legacySubjectForUsername(env: Env, username: string): Promise<string> {
+	return usernameIndexHash(env, username);
 }
 
 /**

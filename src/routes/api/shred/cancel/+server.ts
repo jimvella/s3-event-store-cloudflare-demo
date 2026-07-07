@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
 import { cancelShred } from '@jimvella/s3-event-store';
-import { getShredContext, readTombstone, subjectForUsername } from '$lib/server/keys';
+import { ensureUserId, getShredContext, readTombstone } from '$lib/server/keys';
 import type { RequestHandler } from './$types';
 
 /**
@@ -14,7 +14,7 @@ export const POST: RequestHandler = async ({ platform, locals }) => {
 	if (!locals.username) throw error(401, 'Not logged in');
 	if (!platform?.env) throw error(500, 'R2 binding unavailable');
 
-	const subject = await subjectForUsername(platform.env, locals.username);
+	const subject = await ensureUserId(platform.env, locals.username);
 	const tombstone = await readTombstone(platform.env, subject);
 	if (!tombstone || tombstone.state === 'cancelled') {
 		throw error(409, 'No shred in progress for your account');

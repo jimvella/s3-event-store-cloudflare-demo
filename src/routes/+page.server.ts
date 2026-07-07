@@ -1,6 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { foldRoom, getStore } from '$lib/server/store';
-import { subjectForUsername } from '$lib/server/keys';
+import { ensureUserId } from '$lib/server/keys';
 import type { PageServerLoad } from './$types';
 
 /** Initial render: the full projection of the chat stream plus a cursor.
@@ -14,7 +14,7 @@ export const load: PageServerLoad = async ({ platform, locals }) => {
 	const { messages, cursor } = await foldRoom(store, platform.env);
 	return {
 		username: locals.username,
-		mySubject: await subjectForUsername(platform.env, locals.username!),
+		mySubject: await ensureUserId(platform.env, locals.username!),
 		messages,
 		cursor
 	};

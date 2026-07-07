@@ -110,8 +110,9 @@ chat/streams/chat:general/e/000000000001.json
 chat/streams/chat:general/c/000000000000.json      ← chunk (a compacted bucket)
 chat/streams/chat:general/head.json                ← head pointer
 chat/streams/$system.key-audit/e/…                 ← key/shred audit stream
-keystore/keys/{subject}/000000.json                ← wrapped data key, one per generation
-keystore/tombstones/{subject}.json                 ← shred state machine
+users/{hmac(username)}.json                        ← account record: { userId } (the login index)
+keystore/keys/{userId}/000000.json                 ← wrapped data key, one per generation
+keystore/tombstones/{userId}.json                  ← shred state machine
 keystore/sweep/checkpoint.json                     ← the shred sweeper's cursor
 ```
 
@@ -157,22 +158,43 @@ key layer end to end, with one demo-owned twist:
   else's.
 
 - **Identifiers vs. attributes.** The one plaintext author field is
-  `subject` — `HMAC-SHA-256(pepper, username)`, truncated to 128 bits, under
-  a server-held pepper, stamped by the ingress. The split is load-bearing:
-  key selection, ownership checks, and projection grouping all need a
-  *stable identifier* **before any key is available**, so that field cannot
-  be encrypted — which is precisely why it must be non-PII by construction
-  (deterministic for lookup, non-reversible even by dictionary). Everything
-  human-readable is an encrypted *attribute*. The same rule the library
-  states for stream IDs ("identifiers live forever outside the encryption
-  boundary — no PII"), applied inside the event body.
+  `subject`, stamped by the ingress. The split is load-bearing: key
+  selection, ownership checks, and projection grouping all need a *stable
+  identifier* **before any key is available**, so that field cannot be
+  encrypted — which is precisely why it must be non-PII by construction, and
+  why it must never change. Everything human-readable is an encrypted
+  *attribute*. The same rule the library states for stream IDs ("identifiers
+  live forever outside the encryption boundary — no PII"), applied inside the
+  event body.
+
+- **The subject is a stable random `userId`, stored — not derived.** A
+  username is mutable and low-entropy, so it makes a poor lifelong key: rename
+  the user and a *derived* subject would orphan their whole key hierarchy. So,
+  as a real app would, the subject is a random 128-bit `userId` minted once at
+  first login and kept in a **user directory** — the demo's stand-in for an
+  account row:
+
+  ```
+  users/{hmac(pepper, username)}.json  →  { "userId": "<32 hex>", "createdAt": … }
+  ```
+
+  Login does a *lookup* (`ensureUserId` in `src/lib/server/keys.ts`): a
+  create-only PUT claims the record on first login (races resolve to one
+  identity), and every later login reads it back. The record's object key is a
+  keyed hash so the directory listing discloses no usernames, and its body
+  holds **no** username — the only place a name lives is encrypted inside
+  events, so erasure still covers it. The pepper now protects only this login
+  index; losing it strands the username→userId mapping (returning users would
+  mint fresh identities) but, unlike a derived-subject scheme, can never
+  orphan keys or ciphertext, because every event carries its `userId` verbatim.
 
   A pleasant consequence: **a raw fold of the log is pseudonymous by
   default**. Test fixtures, analytics, and replication targets see opaque
-  subjects and ciphertext names — anonymisation almost for free; identity
-  exists only where keyring access is granted. (Erasure still has honest
-  limits: *that* subject `9a8f…` posted N messages at these timestamps
-  survives forever — shredding destroys content and linkage, not existence.)
+  userIds and ciphertext names — anonymisation almost for free; identity
+  exists only where the user directory *and* keyring access are granted.
+  (Erasure still has honest limits: *that* userId posted N messages at these
+  timestamps survives forever — shredding destroys content and linkage, not
+  existence.)
 
 - **Key management lives under a prefix of the same bucket.** The library's
   `createS3KeyStore` takes any `StorageDriver`, so a ~25-line prefix-rebasing
@@ -228,14 +250,16 @@ rendered as a table. A good demo script:
    erased — text *and* author name — within seconds, posting returns 410, and
    `ShredRequested` lands on the audit stream. Run the sweeper early — alice
    shows up in `openSubjects`, untouched. **Cancel** — her messages come back.
-4. Shred again, wait out the 60s, run the sweeper: `keystore/keys/{subject}/…`
+4. Shred again, wait out the 60s, run the sweeper: `keystore/keys/{userId}/…`
    disappears from the bucket, `ShredCompleted` lands, and the log's
-   ciphertext is now permanently unreadable — alice is an anonymous subject
-   hash everywhere, including on the Keys page itself. Log out — the username
-   is burned.
+   ciphertext is now permanently unreadable — alice is an anonymous userId
+   everywhere, including on the Keys page itself. Log out — the username is
+   burned (its directory record and tombstone both survive the shred).
 5. As bob, **Rotate key**: gen `000001` appears; his old messages decrypt
    under `000000`, new ones carry `keyId: "000001"` — generational keys,
-   visible per field.
+   visible per field. Note his `userId` (and key hierarchy) is unchanged by a
+   rotation — and would survive a *rename* too, which is the whole reason the
+   subject is a stored id rather than a hash of the name.
 
 **Secrets.** Local dev falls back to published constants so `npm run dev`
 works with zero setup. A real deployment must set both:
@@ -243,7 +267,7 @@ works with zero setup. A real deployment must set both:
 ```sh
 # 32 random bytes, base64 — wraps every data key
 openssl rand -base64 32 | npx wrangler secret put MASTER_KEY_SECRET
-# any high-entropy string — keys the username → subject hash
+# any high-entropy string — keys the username → userId login index
 openssl rand -base64 32 | npx wrangler secret put SUBJECT_PEPPER
 ```
 
@@ -315,7 +339,7 @@ src/
     keyringClient.ts       browser keyring fetch/cache + fail-closed field decryption
     server/store.ts        store wiring (chunkSize 5, encrypting serializer), projection, raw-append ingress, edge-cache helpers
     server/fieldCrypto.ts  the field-level encrypting serializer (PayloadSerializer seam)
-    server/keys.ts         key store under keystore/ (prefixedDriver), subject hashing, shred context
+    server/keys.ts         user directory (username→userId), key store under keystore/ (prefixedDriver), shred context
     server/browser.ts      raw R2 access for the Storage view (list / get / wipe)
   routes/
     +layout.server.ts      require a username (redirect to /login otherwise)

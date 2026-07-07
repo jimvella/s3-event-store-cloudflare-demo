@@ -19,7 +19,7 @@ import {
 } from '@jimvella/s3-event-store';
 import { r2BindingDriver, type R2BucketLike } from '@jimvella/s3-event-store/drivers/r2-binding';
 import { fieldEncryptingSerializer } from '$lib/server/fieldCrypto';
-import { getKeyStore, subjectForUsername } from '$lib/server/keys';
+import { ensureUserId, getKeyStore, legacySubjectForUsername } from '$lib/server/keys';
 import {
 	ROOM_STREAM,
 	type ChatEventType,
@@ -146,8 +146,12 @@ export async function foldRoom(
 	}
 	const messages = [...map.values()].sort((a, b) => a.seq - b.seq);
 	for (const m of messages) {
+		// Events written before the `subject` field existed carry a plaintext
+		// username; their historical subject was the keyed hash of it (that era
+		// derived the subject directly — see legacySubjectForUsername), and their
+		// keys still live under it. Backfill that so old messages keep decrypting.
 		if (!m.subject && typeof m.username === 'string') {
-			m.subject = await subjectForUsername(env, m.username);
+			m.subject = await legacySubjectForUsername(env, m.username);
 		}
 	}
 	return { messages, cursor: maxVersion + 1 };
@@ -272,7 +276,10 @@ export async function appendEvents(
 		throw new CommandError(400, '`events` must be a non-empty array');
 	}
 	// Fold once to a working state, then authorize each event against it.
-	const subject = await subjectForUsername(env, username);
+	// The acting user's subject is their stable userId (minted at first login,
+	// resolved from the user directory) — the same value their events carry, so
+	// ownership and key selection are stable across renames.
+	const subject = await ensureUserId(env, username);
 	const { messages } = await foldRoom(store, env);
 	const state = new Map(messages.map((m) => [m.id, { ...m }]));
 	const inputs = events.map((e) => authorizeEvent(e, username, subject, state));

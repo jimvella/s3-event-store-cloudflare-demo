@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
 import { requestShred } from '@jimvella/s3-event-store';
-import { getShredContext, subjectForUsername } from '$lib/server/keys';
+import { ensureUserId, getShredContext } from '$lib/server/keys';
 import type { RequestHandler } from './$types';
 
 /**
@@ -20,7 +20,7 @@ export const POST: RequestHandler = async ({ platform, locals }) => {
 	if (!platform?.env) throw error(500, 'R2 binding unavailable');
 
 	const ctx = getShredContext(platform.env);
-	const subject = await subjectForUsername(platform.env, locals.username);
+	const subject = await ensureUserId(platform.env, locals.username);
 	const { intentPosition } = await requestShred(ctx, subject);
 
 	return json(
