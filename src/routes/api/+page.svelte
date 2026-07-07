@@ -16,8 +16,10 @@
 		placeholder?: string;
 		multiline?: boolean;
 	}
+	type GroupId = 'log' | 'keys';
 	interface Endpoint {
 		id: string;
+		group: GroupId; // which family this endpoint belongs to
 		method: 'GET' | 'POST' | 'PATCH' | 'DELETE';
 		path: string; // may contain {name} path params
 		title: string;
@@ -25,6 +27,29 @@
 		fields: Field[];
 		danger?: boolean;
 	}
+	interface Group {
+		id: GroupId;
+		icon: string;
+		label: string;
+		blurb: string;
+	}
+
+	// The two families the endpoints split into — the append-only log itself,
+	// and the key layer that keeps it private and erasable.
+	const GROUPS: Group[] = [
+		{
+			id: 'log',
+			icon: '📜',
+			label: 'Event sourcing — the append-only log',
+			blurb: "The library's own store primitives: append client-built events, read them back as a paginated feed, and poll the head. No encryption here — just the log over object storage."
+		},
+		{
+			id: 'keys',
+			icon: '🔐',
+			label: 'Encryption & crypto-shredding — the key layer',
+			blurb: 'What makes messages private and erasable (model B): keyring delivery for in-browser decryption, key rotation, and the GDPR crypto-shredding workflow (request → cancel / sweep).'
+		}
+	];
 	interface Result {
 		status: number;
 		ok: boolean;
@@ -45,11 +70,13 @@
 	// Response headers worth surfacing to show the caching contract.
 	const SHOWN_HEADERS = ['cache-control', 'etag', 'content-type', 'vary', 'age'];
 
-	// The client-facing seam: every HTTP call the browser SPA makes to the Worker —
-	// all of them the library's own primitives (append, feed, head).
+	// The client-facing seam: every HTTP call the browser SPA makes to the Worker,
+	// split across two families (see GROUPS) — the log primitives (append, feed,
+	// head) and the key layer (keyring, rotate, shred/cancel/sweep).
 	const ENDPOINTS: Endpoint[] = [
 		{
 			id: 'append',
+			group: 'log',
 			method: 'POST',
 			path: '/streams/chat:general/events',
 			title: 'Raw append — submit client-built events',
@@ -60,6 +87,7 @@
 		},
 		{
 			id: 'feed',
+			group: 'log',
 			method: 'GET',
 			path: '/streams/chat:general/events',
 			title: 'Read the log as a paginated feed',
@@ -68,6 +96,7 @@
 		},
 		{
 			id: 'head',
+			group: 'log',
 			method: 'GET',
 			path: '/streams/chat:general/head',
 			title: 'Read the pollable head resource',
@@ -83,6 +112,7 @@
 		},
 		{
 			id: 'keyring',
+			group: 'keys',
 			method: 'GET',
 			path: '/keys/{subject}/keyring',
 			title: 'Keyring delivery — the decryption keys (model B)',
@@ -91,6 +121,7 @@
 		},
 		{
 			id: 'rotate',
+			group: 'keys',
 			method: 'POST',
 			path: '/api/keys/rotate',
 			title: 'Rotate your data key',
@@ -99,6 +130,7 @@
 		},
 		{
 			id: 'shred',
+			group: 'keys',
 			method: 'POST',
 			path: '/api/shred',
 			title: 'Request crypto-shredding (GDPR erasure) of YOUR account',
@@ -108,6 +140,7 @@
 		},
 		{
 			id: 'shred-cancel',
+			group: 'keys',
 			method: 'POST',
 			path: '/api/shred/cancel',
 			title: 'Cancel a pending shred',
@@ -116,6 +149,7 @@
 		},
 		{
 			id: 'sweep',
+			group: 'keys',
 			method: 'POST',
 			path: '/api/shred/sweep',
 			title: 'Run the shred sweeper',
@@ -367,9 +401,19 @@
 			of this JSON seam.
 		</p>
 
-		{#each ENDPOINTS as ep (ep.id)}
-			{@const preview = build(ep)}
-			<section class="card" class:danger={ep.danger} id="card-{ep.id}">
+		{#each GROUPS as g (g.id)}
+			<div class="group" data-group={g.id}>
+				<div class="group-head">
+					<span class="group-icon">{g.icon}</span>
+					<div class="group-text">
+						<h2>{g.label}</h2>
+						<p class="group-blurb">{g.blurb}</p>
+					</div>
+				</div>
+
+				{#each ENDPOINTS.filter((e) => e.group === g.id) as ep (ep.id)}
+					{@const preview = build(ep)}
+					<section class="card" class:danger={ep.danger} id="card-{ep.id}">
 				<div class="head">
 					<span class="method m-{ep.method}">{ep.method}</span>
 					<code class="path">{ep.path}</code>
@@ -473,7 +517,9 @@
 					</div>
 				{/if}
 			</section>
-		{/each}
+			{/each}
+		</div>
+	{/each}
 	</div>
 </div>
 
@@ -544,8 +590,43 @@
 		color: var(--muted);
 		margin: 0 0 1rem;
 	}
+	.group {
+		margin-bottom: 1.6rem;
+	}
+	.group[data-group='log'] {
+		--gaccent: #2563eb;
+	}
+	.group[data-group='keys'] {
+		--gaccent: #7c3aed;
+	}
+	.group-head {
+		display: flex;
+		align-items: flex-start;
+		gap: 0.6rem;
+		margin-bottom: 0.9rem;
+		padding-bottom: 0.55rem;
+		border-bottom: 2px solid color-mix(in srgb, var(--gaccent) 45%, var(--border));
+	}
+	.group-icon {
+		font-size: 1.4rem;
+		line-height: 1.2;
+	}
+	.group-text h2 {
+		margin: 0;
+		font-size: 0.92rem;
+		color: var(--text);
+	}
+	.group-blurb {
+		margin: 0.2rem 0 0;
+		font-size: 0.75rem;
+		color: var(--muted);
+		max-width: 68ch;
+	}
 	.card {
 		border: 1px solid var(--border);
+		/* A thin left stripe in the group's accent colour, so a card's family
+		   stays legible even when its header has scrolled off. */
+		border-left: 3px solid var(--gaccent);
 		border-radius: 12px;
 		background: var(--surface);
 		padding: 0.85rem 1rem;
